@@ -1,0 +1,191 @@
+# =====================================================================
+# eノート朝の準備（サブカルテ自動オープン）
+#   「7:30にPCが起動していなくても、PCを立ち上げた時に必ず上がる」ようにする
+#
+#   やること:
+#     1) 今の状態を診断して画面に出す（なぜ動かなかったかの手がかり）
+#     2) トリガーを4本に張り替える
+#          ①ログオン時（PCを起動して入った時）
+#          ②ロック解除時（スリープから戻って画面に入った時）
+#          ③スリープ復帰イベント（ロックが無い設定でも拾う）
+#          ④毎日7:25から20分おきに8時間（取りこぼしの最終保険）
+#     3) 今日が対象日（月水金土）でまだ未実行なら、その場で1回走らせる
+#
+#   実行: powershell -ExecutionPolicy Bypass -File fix_enote_triggers.ps1
+#   管理者権限は不要。何度実行しても安全（同じ状態に揃えるだけ）。
+# =====================================================================
+$ErrorActionPreference = 'Stop'
+$taskName = 'eNote朝の準備（サブカルテ自動オープン）'
+$NS = 'Root/Microsoft/Windows/TaskScheduler'
+
+function Head($m) { Write-Host "`n■ $m" -ForegroundColor Cyan }
+function OK($m)   { Write-Host "   OK  $m" -ForegroundColor Green }
+function NG($m)   { Write-Host "   NG  $m" -ForegroundColor Red }
+function Note($m) { Write-Host "   ・  $m" -ForegroundColor Gray }
+
+Write-Host "===== eノート朝の準備 / 起動時実行の修正 =====" -ForegroundColor Yellow
+Write-Host "PC名: $env:COMPUTERNAME   ユーザー: $env:USERNAME   現在時刻: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+# --------------------------------------------------------------------
+# 1. 診断
+# --------------------------------------------------------------------
+Head '1. いまの状態を確認'
+
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if (-not $task) {
+    NG "タスク「$taskName」が登録されていません。"
+    Note 'まず セットアップ実行.bat（setup.ps1）を先に実行してください。'
+    Read-Host "`nEnterで終了"
+    exit 1
+}
+OK 'タスクは登録されています'
+
+$info = Get-ScheduledTaskInfo -TaskName $taskName
+Note "前回の実行: $($info.LastRunTime)"
+Note "前回の結果: $($info.LastTaskResult)  （0＝正常終了 / それ以外は失敗）"
+Note "次回の予定: $($info.NextRunTime)"
+Note "取りこぼし回数: $($info.NumberOfMissedRuns)"
+
+Write-Host "`n   今のトリガー:"
+foreach ($tg in $task.Triggers) {
+    $kind = ($tg.CimClass.CimClassName -replace 'MSFT_Task', '' -replace 'Trigger', '')
+    Write-Host ("     - {0}  開始={1} 遅延={2} 有効={3}" -f $kind, $tg.StartBoundary, $tg.Delay, $tg.Enabled)
+}
+
+# スクリプトの置き場所と「今日はもう実行済みか」のマーカー
+$dest = $task.Actions[0].WorkingDirectory
+if (-not $dest -or -not (Test-Path $dest)) {
+    $dest = Join-Path $env:USERPROFILE 'Desktop\AI\enote-morning'
+}
+$marker = Join-Path $dest 'last_run_date.txt'
+$today = (Get-Date).ToString('yyyy-MM-dd')
+$markVal = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { '(なし)' }
+Note "スクリプト置き場: $dest"
+Note "実行済みマーカー: $markVal  （今日＝$today）"
+
+# PCがいつ起きたのか（＝7:30にPCが無かったことの裏取り）
+Head '2. このPCが最後に起動／復帰した時刻'
+try {
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    Note "最終起動: $boot"
+} catch { Note '最終起動: 取得できず' }
+try {
+    $wakes = Get-WinEvent -FilterHashtable @{
+        LogName = 'System'; ProviderName = 'Microsoft-Windows-Power-Troubleshooter'; Id = 1
+        StartTime = (Get-Date).AddDays(-2)
+    } -ErrorAction SilentlyContinue | Select-Object -First 5
+    if ($wakes) {
+        foreach ($w in $wakes) { Note "スリープ復帰: $($w.TimeCreated)" }
+    } else {
+        Note 'スリープ復帰の記録なし（＝電源OFFからの起動だった可能性が高い）'
+    }
+} catch { Note 'スリープ復帰: 取得できず' }
+
+# タスクスケジューラの履歴（既定で無効なことがある）
+Head '3. タスクスケジューラの履歴（直近2日）'
+try {
+    $ev = Get-WinEvent -FilterHashtable @{
+        LogName = 'Microsoft-Windows-TaskScheduler/Operational'; StartTime = (Get-Date).AddDays(-2)
+    } -ErrorAction Stop | Where-Object { $_.Message -like "*$taskName*" } | Select-Object -First 12
+    if ($ev) {
+        foreach ($e in $ev) {
+            Write-Host ("     {0}  ID={1}  {2}" -f $e.TimeCreated, $e.Id, ($e.Message -split "`n")[0])
+        }
+    } else { Note '該当する履歴なし' }
+} catch {
+    Note '履歴ログが無効です（既定で無効。原因追跡が要るときだけ管理者PowerShellで有効化できます）'
+    Note '  wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true'
+}
+
+# --------------------------------------------------------------------
+# 4. トリガーの張り替え
+# --------------------------------------------------------------------
+Head '4. トリガーを張り替える'
+
+# ① ログオン時（ユーザーはSIDで指定する。名前指定だとMSアカウント等で一致しないことがある）
+try {
+    $sid = ([Security.Principal.NTAccount]"$env:USERDOMAIN\$env:USERNAME").Translate([Security.Principal.SecurityIdentifier]).Value
+} catch {
+    $sid = $null
+}
+$tLogon = New-ScheduledTaskTrigger -AtLogOn
+if ($sid) { $tLogon.UserId = $sid }
+$tLogon.Delay = 'PT40S'      # ネットにつながるのを40秒待つ
+OK 'ログオン時トリガー'
+
+# ② ロック解除時（スリープから戻って画面に入った時）
+$tUnlock = $null
+try {
+    $cls = Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace $NS
+    $tUnlock = New-CimInstance -CimClass $cls -ClientOnly
+    $tUnlock.StateChange = 8                                  # 8 = SessionUnlock
+    if ($sid) { $tUnlock.UserId = $sid } else { $tUnlock.UserId = "$env:USERDOMAIN\$env:USERNAME" }
+    $tUnlock.Delay = 'PT40S'
+    $tUnlock.Enabled = $true
+    OK 'ロック解除時トリガー'
+} catch { NG "ロック解除時トリガーは作れませんでした（続行します）: $($_.Exception.Message)" }
+
+# ③ スリープ復帰イベント（ロック画面を使っていなくても拾える）
+$tWake = $null
+try {
+    $cls = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace $NS
+    $tWake = New-CimInstance -CimClass $cls -ClientOnly
+    $tWake.Subscription = "<QueryList><Query Id='0' Path='System'><Select Path='System'>*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]</Select></Query></QueryList>"
+    $tWake.Delay = 'PT60S'
+    $tWake.Enabled = $true
+    OK 'スリープ復帰トリガー'
+} catch { NG "スリープ復帰トリガーは作れませんでした（続行します）: $($_.Exception.Message)" }
+
+# ④ 毎日7:25から20分おきに8時間（最終保険）
+#    曜日の判定はスクリプト側（月水金土）が持っているので、ここは毎日でよい。
+#    1日1回マーカーがあるため、成功後の回は静かにスキップされる＝通知は増えない。
+$tDaily = New-ScheduledTaskTrigger -Daily -At '7:25AM'
+$rep = (New-ScheduledTaskTrigger -Once -At '7:25AM' `
+        -RepetitionInterval (New-TimeSpan -Minutes 20) `
+        -RepetitionDuration (New-TimeSpan -Hours 8)).Repetition
+$tDaily.Repetition = $rep
+OK '毎日7:25＋20分おき8時間トリガー'
+
+$triggers = @($tLogon)
+if ($tUnlock) { $triggers += $tUnlock }
+if ($tWake)   { $triggers += $tWake }
+$triggers += $tDaily
+
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+
+try {
+    Set-ScheduledTask -TaskName $taskName -Trigger $triggers -Settings $settings | Out-Null
+    OK 'タスクを更新しました'
+} catch {
+    NG "更新に失敗: $($_.Exception.Message)"
+    Read-Host "`nEnterで終了"
+    exit 1
+}
+
+Write-Host "`n   更新後のトリガー:"
+foreach ($tg in (Get-ScheduledTask -TaskName $taskName).Triggers) {
+    $kind = ($tg.CimClass.CimClassName -replace 'MSFT_Task', '' -replace 'Trigger', '')
+    Write-Host ("     - {0}  開始={1} 遅延={2}" -f $kind, $tg.StartBoundary, $tg.Delay)
+}
+
+# --------------------------------------------------------------------
+# 5. 今日ぶんがまだなら、いま走らせる
+# --------------------------------------------------------------------
+Head '5. 今日ぶんの実行'
+$isTargetDay = @('Monday', 'Wednesday', 'Friday', 'Saturday') -contains (Get-Date).DayOfWeek.ToString()
+if (-not $isTargetDay) {
+    Note "今日は対象曜日（月水金土）ではないので実行しません"
+} elseif ($markVal -eq $today) {
+    Note "今日ぶんは実行済みです（マーカー $markVal）"
+} else {
+    Note '今日ぶんが未実行なので、いま1回走らせます...'
+    Start-ScheduledTask -TaskName $taskName
+    Start-Sleep -Seconds 5
+    Note "状態: $((Get-ScheduledTask -TaskName $taskName).State)"
+    Note '1〜2分で患者一覧のページがブラウザに出て、LINEワークスにも通知が届きます'
+}
+
+Write-Host "`n===== 完了 =====" -ForegroundColor Yellow
+Write-Host '次からは、7:30にPCが消えていても「PCを起動した時」「スリープから戻した時」に自動で上がります。'
+Read-Host "`nEnterで終了"
