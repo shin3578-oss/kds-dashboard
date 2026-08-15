@@ -36,7 +36,7 @@ if (-not $task) {
     NG "タスク「$taskName」が登録されていません。"
     Note 'まず セットアップ実行.bat（setup.ps1）を先に実行してください。'
     Read-Host "`nEnterで終了"
-    exit 1
+    return
 }
 OK 'タスクは登録されています'
 
@@ -160,7 +160,7 @@ try {
 } catch {
     NG "更新に失敗: $($_.Exception.Message)"
     Read-Host "`nEnterで終了"
-    exit 1
+    return
 }
 
 Write-Host "`n   更新後のトリガー:"
