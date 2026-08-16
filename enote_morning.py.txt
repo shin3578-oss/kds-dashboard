@@ -1,0 +1,521 @@
+# -*- coding: utf-8 -*-
+"""
+デンタルeノート サブカルテ自動オープン（朝の準備）
+
+院長が出勤する日（アポツールのシフト表で判定。2026-08時点は水・金・土）の朝に実行し、
+当日の院長担当患者（アポツールで担当欄＝小林 の予約すべて。列は問わない）の
+サブカルテをデンタルeノート上で開く準備をする。
+
+フロー:
+  0. アポツールのシフト表 → その日、院長が出勤かどうか
+  1. アポツール予約API → 当日の対象患者リスト（診察券番号・氏名・時刻）
+  2. eNoteローカルDB → 診察券番号からノートタイトルを解決
+  3. ノートを開く:
+     a) links.json にノートリンク(mmjloc URL)があれば直接オープン（完全自動）
+     b) なければランチャーHTML生成 → ブラウザで表示（1タップで検索表示）
+  4. 結果を LINE WORKS へ通知（lw_notify.yml を workflow_dispatch で起動）
+
+実行環境: 院長メインPC＋持ち歩きノートPCの2台（Task Scheduler、朝）。
+このタスクは「そのPCでeNoteを開く」ことが目的のため、PC電源に依存する
+構成が本質的に必要（クラウド移行不可）。失敗時はLINE通知でフォローする。
+どちらのPCから来た通知か分かるよう、通知の見出しにPC名を入れる
+（.env の ENOTE_PC_LABEL。未設定ならコンピューター名）。
+"""
+
+import asyncio
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from datetime import date, datetime
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
+BASE_DIR = Path(__file__).parent
+LOG_FILE = BASE_DIR / "enote_morning.log"
+
+from dotenv import load_dotenv
+
+# .env の場所はPCごとに違うため、上位フォルダ→自フォルダの順に探す
+# （メインPC＝Desktop\AI\.env／ノートPCも同じ構成にしておけばそのまま動く）
+for _cand in (BASE_DIR.parent / ".env", BASE_DIR / ".env"):
+    if _cand.exists():
+        load_dotenv(_cand)
+        break
+
+EMAIL = os.environ.get("APOTOOL_EMAIL", "")
+PASSWORD = os.environ.get("APOTOOL_PASSWORD", "")
+GITHUB_PAT = os.environ.get("GITHUB_PAT", "")
+
+# このPCの呼び名。メインPCとノートPCで併用するため、通知に必ず入れて区別する
+# （.env に ENOTE_PC_LABEL=ノートPC と書けばその名前になる）
+PC_LABEL = os.environ.get("ENOTE_PC_LABEL") or os.environ.get("COMPUTERNAME", "PC")
+
+BASE_URL = "https://apo-toolboxes.stransa.co.jp"
+LOGIN_URL = "https://user.stransa.co.jp/login"
+
+# eNote ローカルDB（大崎オーバルコート歯科室サブカルテ = ドライブ52340117102）
+ENOTE_LOCALSTATE = Path(os.environ["LOCALAPPDATA"]) / "Packages" / \
+    "MetaMoJiCorporation.MetaMoJiDentaleNote6_dprdgbsyk6pqc" / "LocalState"
+PRIMARY_DRIVE_ID = "52340117102"
+
+# ノートリンクのキャッシュ（診察券番号 → mmjloc URL）。Phase 2 で使用。
+LINKS_FILE = BASE_DIR / "links.json"
+
+# LINE WORKS 通知（apotool リポジトリの lw_notify.yml を起動）
+LW_NOTIFY_REPO = "shin3578-oss/apotool-automation"
+BOT_DONE = "12786833"   # 完了通知Bot
+BOT_FAIL = "12789558"   # 失敗通知Bot
+
+DRY_RUN = "--dry-run" in sys.argv          # 取得と解決のみ（開かない・通知しない）
+NO_NOTIFY = "--no-notify" in sys.argv      # 通知だけ抑止
+FORCE = "--force" in sys.argv              # 曜日ガード・1日1回ガードを無視して実行
+
+# 実行する曜日の一次フィルタ（Python weekday: 月=0 … 日=6）。日曜は必ず休診なので
+# ログインもしない。実際に走らせるかどうかは「その日、院長がシフトに入っているか」を
+# アポツールのシフト表で見て決める（下の fetch_kobayashi_shift）。
+# 2026-08-17 変更: 以前は {月,水,金,土} を直書きしていたが、院長の勤務は水金土で
+# 月曜はシフト外。月曜に4（院長）列の初診枠を拾って一覧を出してしまい院長から指摘。
+# 曜日の直書きはシフト変更で必ずズレるため、シフト表を正本にした。
+TARGET_WEEKDAYS = {0, 1, 2, 3, 4, 5}
+# 1日1回だけ実行するためのマーカー（ログオン時トリガーは毎日・複数回発火するため）
+RUN_MARKER = BASE_DIR / "last_run_date.txt"
+
+
+def ran_today() -> bool:
+    try:
+        return RUN_MARKER.read_text(encoding="utf-8").strip() == date.today().isoformat()
+    except OSError:
+        return False
+
+
+def mark_ran_today():
+    try:
+        RUN_MARKER.write_text(date.today().isoformat(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def log(msg: str):
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ─── アポツール ──────────────────────────────────────────────
+async def fetch_kobayashi_shift(page, target: date) -> bool | None:
+    """その日、院長（小林）がシフトに入っているかを返す。判定できなければ None。
+
+    アポツール /user/shifts/view/YYYY/MM のスタッフ行を読む。
+    - `shift-assigned` が付いた日 = 出勤
+    - `rest-all` が付いた日 = 休診（シフトのひな型で出勤扱いでも休診が優先。
+      実例 2026-08-12〜14 のお盆は両方のクラスが付く）
+    注意: これらのクラスはページ読み込み後に JavaScript が付ける。
+    生HTMLを fetch しても付いていないので、必ず描画後のDOMを読むこと。
+    """
+    url = f"{BASE_URL}/user/shifts/view/{target.year}/{target.month:02d}"
+    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    await asyncio.sleep(2)  # クラス付与のJSを待つ
+    info = await page.evaluate(
+        """(day) => {
+            for (const tr of document.querySelectorAll('tr')) {
+                const head = tr.querySelector('td.shift-resource');
+                if (!head || !head.textContent.includes('小林')) continue;
+                const cell = tr.querySelector('td[data-day="' + day + '"]');
+                if (!cell) return null;
+                // 見出しセルには「シフト」ボタンも同居するので、名前のリンクだけを取る
+                const a = head.querySelector('a');
+                return {name: (a ? a.textContent : head.textContent).trim(), cls: cell.className};
+            }
+            return null;
+        }""", target.day)
+    if not info:
+        log("⚠ シフト表に院長の行が見つからない（判定できないので出勤扱いで続行）")
+        return None
+    cls = info.get("cls", "")
+    assigned = "shift-assigned" in cls
+    rest = "rest-all" in cls
+    log(f"  シフト: {info.get('name')} 出勤={assigned} 休診={rest}")
+    return assigned and not rest
+
+
+async def fetch_today_targets() -> tuple[list[dict], bool | None]:
+    """当日の院長担当の予約を時刻順で返す。戻り値は (対象リスト, 院長の出勤有無)"""
+    from playwright.async_api import async_playwright
+
+    target = date.today()
+    date_str = target.strftime("%Y/%m/%d")
+    date_filter = target.strftime("%Y-%m-%d")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        # ログイン（既存スクリプトと同一パターン）
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+        await asyncio.sleep(2)
+        sel = page.locator('input[type="email"]')
+        if await sel.count():
+            await sel.fill(EMAIL)
+        else:
+            await page.locator('input[type="text"], input:not([type])').first.fill(EMAIL)
+        await page.fill('input[type="password"]', PASSWORD)
+        await page.locator('button[type="submit"]').first.click()
+        try:
+            await page.wait_for_url(re.compile(r"stransa\.co\.jp/(?!login)"), timeout=20_000)
+        except Exception:
+            pass
+        await page.goto("https://user.stransa.co.jp/offices", wait_until="domcontentloaded", timeout=60_000)
+        try:
+            await page.wait_for_url(re.compile(r"apo-toolboxes\.stransa\.co\.jp"), timeout=20_000)
+        except Exception:
+            pass
+        if "apo-toolboxes" not in page.url:
+            await page.goto(f"{BASE_URL}/calendar/", wait_until="domcontentloaded", timeout=60_000)
+
+        # 院長がその日シフトに入っているか（4列の未定枠を拾うかどうかの判断に使う）
+        on_shift = await fetch_kobayashi_shift(page, target)
+
+        await page.goto(f"{BASE_URL}/user/patient/cancel", wait_until="domcontentloaded", timeout=60_000)
+        clinic_key = await page.evaluate(
+            "() => { const el = document.getElementById('master-json');"
+            " return el ? JSON.parse(el.textContent).clinicKey : null; }")
+        if not clinic_key:
+            raise RuntimeError("clinicKey が取得できない")
+
+        # 予約APIはlimit無視・1ページ約50件・条件指定が信用できない。
+        # starts_at desc（未来が先頭）でページを進め、対象日を下回ったら打ち切る
+        # （monshin_visit_alert.py と同じ実績方式。教訓 2026-07-17「1ページ前提は不可」）
+        all_items: list[dict] = []
+        page_num, done = 1, False
+        MAX_PAGES = 120  # 安全弁（約6000件ぶん）
+        while page_num <= MAX_PAGES and not done:
+            # 予約APIは時折スパッと空レスポンスを返す（2026-08-08実測）。
+            # これを終端と誤認すると「対象0名」で静かに終わってしまうため、必ず再試行する。
+            items = []
+            for attempt in range(5):
+                resp = await page.evaluate(
+                    """async ([url, body]) => {
+                        const r = await fetch(url, {method:"POST",
+                            headers:{"Content-Type":"application/json","X-Requested-With":"XMLHttpRequest"},
+                            body: JSON.stringify(body)});
+                        const t = await r.text();
+                        try { return JSON.parse(t); } catch { return {"_status": r.status}; }
+                    }""",
+                    [f"{BASE_URL}/user/patient/load_patients", {
+                        "key": clinic_key, "type": "reservation", "condition": {},
+                        "sort": {"order_field": "starts_at", "order_flag": "desc"},
+                        "page": page_num, "limit": 9999,
+                    }])
+                items = resp.get("items", []) if isinstance(resp, dict) else []
+                if items:
+                    break
+                log(f"  予約ページ{page_num}: 空レスポンス 再試行{attempt + 1}/5 ({resp})")
+                await asyncio.sleep(3)
+            if not items:
+                # 正常な終わり方は「対象日より過去に到達（done=True）」の一択。
+                # 空で終わる＝APIが落ちているので、中途半端なリストを出さず失敗させる
+                raise RuntimeError(
+                    f"予約APIが空を返し続ける（ページ{page_num}まで走査・当日{len(all_items)}件しか取れていない）")
+
+            def _sa(r):
+                v = r.get("starts_at", "")
+                return v.get("date", "") if isinstance(v, dict) else str(v)
+
+            todays = 0
+            for r in items:
+                d = _sa(r)[:10]
+                if not d:
+                    continue
+                if d < date_filter:
+                    done = True  # 未来先頭descなので対象日を下回った＝以降は全て過去
+                    break
+                if d == date_filter:
+                    todays += 1
+                    all_items.append(r)
+            log(f"  予約ページ{page_num}: 当日{todays}件 / 取得{len(items)}件")
+            page_num += 1
+            await asyncio.sleep(0.2)
+
+        await browser.close()
+        if page_num > MAX_PAGES and not done:
+            log("⚠ ページ上限まで走査しても対象日に到達せず（取りこぼしの可能性）")
+
+    # 対象抽出: 担当（staff/staff2/staff3）に「小林」 or 4（院長）列
+    def staff_names(r):
+        names = []
+        for k in ("staff", "staff2", "staff3"):
+            v = r.get(k)
+            if isinstance(v, dict) and v.get("name"):
+                names.append(v["name"])
+        return names
+
+    targets = []
+    seen = set()
+    for r in all_items:
+        if r.get("deleted_at") or (r.get("cancel_memo") or "").strip():
+            continue  # 削除済み・キャンセルは除外
+        unit = r.get("unit_name", "") or ""
+        staffs = staff_names(r)
+        # 対象条件は次の2つのOR。
+        # (1) 担当名に「小林」が入る枠（列は問わない・2026-07-29確定）
+        #   - 院長はコンサル枠・欄外2・A列でも診るため「4列AND」だと取りこぼす
+        #     （実例 2026-07-29: 那須映美=コンサル / 中澤由美子=欄外2 / 木下恵=A列）
+        #   - 4列でも担当が別スタッフ（例: 濱成宏・渡邉旭）の枠は担当名で自動的に除外される
+        # (2) 4（院長）列で担当が FREE.Dr（未定）or 未設定の枠（2026-08-08 院長判断で追加）
+        #   - 4列は院長が診る前提。担当が未確定なだけでカルテを開かないのは実態に合わない
+        #     （実例 2026-08-08: No.7675 垣内俊哉 14:30 が落ちていた）
+        #   - ただし【院長が出勤している日に限る】（2026-08-17 追加）。
+        #     院長がシフト外の日（月・火・木）は4列の未定枠を別のドクターが診るため、
+        #     拾うと他院のドクターの患者のカルテを開いてしまう
+        #     （実例 2026-08-17 月: 初診2名を院長担当として一覧に出し院長から指摘）
+        is_kobayashi = any("小林" in n for n in staffs)
+        is_free_dr_4 = (on_shift is not False) and unit.startswith("4") and (
+            not staffs or any("FREE" in n.upper() for n in staffs))
+        is_target = is_kobayashi or is_free_dr_4
+        if not is_target:
+            continue
+        reg = str(r.get("registration_number") or "").strip()
+        v = r.get("starts_at", {})
+        t = (v.get("date", "") if isinstance(v, dict) else str(v))[11:16]
+        key = (reg, r.get("name", ""))
+        if key in seen:
+            continue  # 同一患者の同日複数枠は1回でよい
+        seen.add(key)
+        targets.append({
+            "reg": reg,
+            "name": r.get("name", ""),
+            "time": t,
+            "unit": unit,
+            "staff": "、".join(staffs),
+        })
+    targets.sort(key=lambda x: x["time"])
+    return targets, on_shift
+
+
+# ─── eNote ノート解決 ─────────────────────────────────────────
+def resolve_notes(targets: list[dict]) -> None:
+    """診察券番号 → eNoteノートタイトル/IDを解決して targets に書き込む"""
+    dbs = sorted(glob.glob(str(ENOTE_LOCALSTATE / "sdstorage" / "*" / "MMJSdDriveContentsContext_*.sqlite")),
+                 key=lambda p: (PRIMARY_DRIVE_ID not in p))  # サブカルテのドライブを優先
+    if not dbs:
+        raise RuntimeError("eNoteのノートDBが見つからない（アプリ未インストール?）")
+
+    rows = []
+    tmp = tempfile.mktemp(suffix=".sqlite")
+    for db in dbs:
+        # アプリ起動中のロック回避のためコピーしてから読む
+        shutil.copy2(db, tmp)
+        con = sqlite3.connect(tmp)
+        rows += con.execute(
+            "select cdTitle, cdId from SdXMODocument where cdTrashed=0 and cdDeleteFlag=0").fetchall()
+        con.close()
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+    # タイトル先頭の番号でインデックス化（例: 5152_林正宏 / 13832 吉田亜希子）
+    by_num: dict[str, tuple[str, str]] = {}
+    for title, doc_id in rows:
+        m = re.match(r"^0*(\d+)[_\s]", title or "")
+        if m and m.group(1) not in by_num:
+            by_num[m.group(1)] = (title, doc_id)
+
+    for t in targets:
+        num = t["reg"].lstrip("0") or t["reg"]
+        hit = by_num.get(num)
+        t["note_title"], t["note_id"] = (hit if hit else (None, None))
+
+
+# ─── ノートを開く ─────────────────────────────────────────────
+def load_links() -> dict:
+    if LINKS_FILE.exists():
+        try:
+            return json.loads(LINKS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def open_url(url: str):
+    subprocess.run(["powershell", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+                   check=False, timeout=30)
+
+
+def to_enote_url(url: str) -> str:
+    """mmjloc の https URL を eNote 直接起動スキームに変換する。
+
+    https のまま開くとブラウザの「アプリを指定して起動する」ページを挟み
+    クリックが必要になる（=自動にならない）。scheme 経由なら直接開く。
+    """
+    if url.startswith("http") and url.endswith(".mmjloc"):
+        return "dentalenotech6:///mmjloc/?uri=" + urllib.parse.quote(url, safe="")
+    return url
+
+
+def open_notes(targets: list[dict]) -> tuple[int, str]:
+    """ノートを開く。戻り値: (自動で開けた件数, 使用した方式)
+
+    リンク登録済みの患者は直接オープン（完全自動）、未登録の患者だけ
+    ランチャーHTMLに載せる混在方式。全員リンク済みならランチャーは出さない。
+    """
+    links = load_links()
+    with_note = [t for t in targets if t["note_title"]]
+
+    linked = [t for t in with_note if links.get(t["reg"])]
+    for t in linked:
+        log(f"  open link: {t['note_title']}")
+        open_url(to_enote_url(links[t["reg"]]))
+        time.sleep(8)  # eNoteの読み込み待ち
+
+    rest = [t for t in targets if t not in linked]
+    if not rest:
+        return len(linked), "link"
+
+    # リンク未登録の患者（＋ノート未作成の患者の注意表示）はランチャーで
+    html = build_launcher_html(rest, links)
+    out = BASE_DIR / "today.html"
+    out.write_text(html, encoding="utf-8")
+    open_url(str(out))
+    return len(linked), "mixed" if linked else "launcher"
+
+
+def build_launcher_html(targets: list[dict], links: dict) -> str:
+    today = date.today()
+    wd = "月火水木金土日"[today.weekday()]
+    rows = []
+    for t in targets:
+        if t["note_title"]:
+            url = (to_enote_url(links[t["reg"]]) if links.get(t["reg"]) else
+                   "dentalenotech6:///searchbytitle/?title=" + urllib.parse.quote(t["note_title"]))
+            btn = f'<a class="btn" href="{url}">開く</a>'
+            title = t["note_title"]
+            cls = ""
+        else:
+            btn = '<span class="none">ノートなし</span>'
+            title = '（eNote未作成）'
+            cls = ' class="miss"'
+        # 患者の表記は「カルテNo → 氏名」の順で全タスク統一（院長指示 2026-08-07）
+        rows.append(
+            f'<tr{cls}><td>{t["time"]}</td><td>No.{t["reg"]}</td><td>{t["name"]}</td>'
+            f'<td>{t["unit"] or t["staff"]}</td><td>{title}</td><td>{btn}</td></tr>')
+    body = "\n".join(rows) or '<tr><td colspan="6">本日の対象患者はいません</td></tr>'
+    return f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<title>本日のサブカルテ {today:%m/%d}({wd})</title>
+<style>
+body{{font-family:'Yu Gothic UI',sans-serif;margin:24px;background:#f6f8fa}}
+h1{{font-size:22px}}
+table{{border-collapse:collapse;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.12)}}
+td,th{{padding:10px 16px;border-bottom:1px solid #e5e5e5;font-size:16px}}
+th{{background:#0EABFF;color:#fff;text-align:left}}
+.btn{{display:inline-block;background:#0EABFF;color:#fff;text-decoration:none;
+padding:6px 20px;border-radius:6px;font-weight:bold}}
+.btn:active{{opacity:.7}}
+.miss td{{color:#999}}
+.none{{color:#c00;font-size:13px}}
+</style></head><body>
+<h1>🦷 本日のサブカルテ {today:%m/%d}({wd})　院長担当 {len(targets)}名</h1>
+<p>「開く」を押すとデンタルeノートで該当患者が表示されます。</p>
+<table><tr><th>時刻</th><th>カルテNo</th><th>患者名</th><th>列/担当</th><th>ノート</th><th></th></tr>
+{body}
+</table></body></html>"""
+
+
+# ─── LINE WORKS 通知 ──────────────────────────────────────────
+def notify(message: str, bot_id: str):
+    if DRY_RUN or NO_NOTIFY:
+        log(f"  [notify skip] {message[:60]}")
+        return
+    if not GITHUB_PAT:
+        log("  GITHUB_PAT なし: 通知スキップ")
+        return
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{LW_NOTIFY_REPO}/actions/workflows/lw_notify.yml/dispatches",
+        data=json.dumps({"ref": "main", "inputs": {"message": message, "bot_id": bot_id}}).encode(),
+        headers={"Authorization": f"Bearer {GITHUB_PAT}",
+                 "Accept": "application/vnd.github+json"},
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            log(f"  notify HTTP {r.status}")
+    except Exception as e:
+        log(f"  notify 失敗: {e}")
+
+
+# ─── main ────────────────────────────────────────────────────
+def main():
+    log(f"=== eNote朝の準備 開始 (dry_run={DRY_RUN}) ===")
+
+    # 曜日ガード・1日1回ガード（--force / --dry-run では無視）
+    # ログオン時トリガーは毎日・複数回発火するため、対象曜日以外と実行済みは静かに抜ける
+    if not FORCE and not DRY_RUN:
+        if date.today().weekday() not in TARGET_WEEKDAYS:
+            log("日曜のためスキップ")
+            return
+        if ran_today():
+            log("本日は既に実行済みのためスキップ")
+            return
+
+    try:
+        targets, on_shift = asyncio.run(fetch_today_targets())
+        log(f"対象患者: {len(targets)}名（院長の出勤={on_shift}）")
+        resolve_notes(targets)
+        for t in targets:
+            log(f"  {t['time']} {t['name']} [{t['unit'] or t['staff']}] -> {t['note_title']}")
+
+        if DRY_RUN:
+            log("dry-run のためここで終了")
+            return
+
+        if not targets and on_shift is False:
+            # 院長がシフト外の日（月・火・木）。以前は曜日の直書きで弾いていた分と同じ状況なので
+            # 通知は出さない。1日1回のマーカーは付けて、この日は再ログインしないようにする
+            log("院長はシフト外・対象患者0名のため通知なしで終了")
+            mark_ran_today()
+            return
+
+        if not targets:
+            notify(f"【eノート朝の準備／{PC_LABEL}】本日の院長担当予約は0件でした（休診または未入力）", BOT_DONE)
+            mark_ran_today()
+            return
+
+        opened, method = open_notes(targets)
+        missing = [t for t in targets if not t["note_title"]]
+        lines = [f"【eノート朝の準備／{PC_LABEL}】{date.today():%m/%d} 院長担当 {len(targets)}名"]
+        if method == "link":
+            lines.append(f"サブカルテ{opened}冊を自動で開きました。")
+        elif method == "mixed":
+            lines.append(f"サブカルテ{opened}冊を自動で開き、残りは患者一覧ページに表示しました。")
+        else:
+            lines.append("患者一覧ページを開きました（ボタン1つで各カルテを表示できます）。")
+        if missing:
+            # 患者の表記は「カルテNo → 氏名」の順で全タスク統一（院長指示 2026-08-07）
+            lines.append("⚠ eNoteにノートが見つからない患者: " +
+                         "、".join(f"No.{t['reg']} {t['name']}" for t in missing))
+        notify("\n".join(lines), BOT_DONE)
+        mark_ran_today()
+        log("=== 完了 ===")
+    except Exception as e:
+        log(f"!!! エラー: {e!r}")
+        notify(f"【eノート朝の準備／{PC_LABEL}】実行失敗: {e!r}\nPC: {PC_LABEL} / Task Scheduler", BOT_FAIL)
+        raise
+
+
+if __name__ == "__main__":
+    main()
