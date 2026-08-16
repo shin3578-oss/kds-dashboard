@@ -32,13 +32,24 @@ if (-not (Test-Path $file)) {
 OK $file
 
 Head 'Python をさがす'
+# まずは登録済みタスクが使っている Python をそのまま使う。
+# PATH の先頭にある Python が必ずしも playwright / dotenv を入れた方とは限らないため
+# （2026-08-17実測: メインPCは PATH=3.11 だがタスクは 3.13 を使っていた）。
 $py = $null
-foreach ($c in @('python.exe', 'python3.exe')) {
-    $found = Get-Command $c -ErrorAction SilentlyContinue
-    if ($found -and $found.Source -notlike '*WindowsApps*') { $py = $found.Source; break }
+$task = Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object { $_.TaskName -like '*eNote*' } | Select-Object -First 1
+if ($task) {
+    $exec = ($task.Actions | Select-Object -First 1).Execute
+    if ($exec -and (Test-Path $exec)) { $py = $exec; OK "タスクが使っている Python: $py" }
+}
+if (-not $py) {
+    foreach ($c in @('python.exe', 'python3.exe')) {
+        $found = Get-Command $c -ErrorAction SilentlyContinue
+        if ($found -and $found.Source -notlike '*WindowsApps*') { $py = $found.Source; break }
+    }
+    if ($py) { OK $py }
 }
 if (-not $py) { NG 'Python が見つかりません。'; return }
-OK $py
 
 Head '新しい中身を取ってくる'
 $tmp = Join-Path $env:TEMP 'enote_morning_new.py'
