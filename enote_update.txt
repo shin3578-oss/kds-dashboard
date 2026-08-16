@@ -1,0 +1,73 @@
+# =====================================================================
+# eノート朝の準備 ─ 中身を最新に入れ替える
+#
+#   なぜ必要か:
+#     2026-08-17（月）の朝、院長のシフト外の日なのに患者一覧が出た。
+#     4（院長）列に入った初診の枠を拾ってしまうためで、その日は別の
+#     ドクターが診る患者だった。曜日の直書きをやめ、アポツールの
+#     シフト表を見て「その日、院長が出勤か」で判断するように直した。
+#
+#   やること:
+#     1) 今の enote_morning.py を控えに取る（戻せるようにする）
+#     2) 新しい enote_morning.py を取ってきて入れ替える
+#     3) その場で試し実行して、ちゃんと動くところまで見届ける
+#
+#   実行（PowerShellに貼るだけ・管理者権限は不要）:
+#     irm https://shin3578-oss.github.io/kds-dashboard/enote_update.txt | iex
+# =====================================================================
+$ErrorActionPreference = 'Stop'
+$SRC = 'https://shin3578-oss.github.io/kds-dashboard/enote_morning.py.txt'
+
+function Head($m) { Write-Host "`n■ $m" -ForegroundColor Cyan }
+function OK($m)   { Write-Host "   OK  $m" -ForegroundColor Green }
+function NG($m)   { Write-Host "   NG  $m" -ForegroundColor Red }
+
+Head 'このPCの設置場所をさがす'
+$dest = Join-Path $env:USERPROFILE 'Desktop\AI\enote-morning'
+$file = Join-Path $dest 'enote_morning.py'
+if (-not (Test-Path $file)) {
+    NG "$file が見つかりません。このPCにはまだ設置されていないようです。"
+    return
+}
+OK $file
+
+Head 'Python をさがす'
+$py = $null
+foreach ($c in @('python.exe', 'python3.exe')) {
+    $found = Get-Command $c -ErrorAction SilentlyContinue
+    if ($found -and $found.Source -notlike '*WindowsApps*') { $py = $found.Source; break }
+}
+if (-not $py) { NG 'Python が見つかりません。'; return }
+OK $py
+
+Head '新しい中身を取ってくる'
+$tmp = Join-Path $env:TEMP 'enote_morning_new.py'
+Invoke-WebRequest -Uri $SRC -OutFile $tmp -UseBasicParsing
+$txt = Get-Content $tmp -Raw -Encoding UTF8
+# 取り違え・通信の途中切れを弾く（この目印が無い＝中身が違う）
+if ($txt -notmatch 'fetch_kobayashi_shift' -or $txt.Length -lt 15000) {
+    NG "取ってきた中身が想定と違います（$($txt.Length)文字）。入れ替えは中止しました。"
+    return
+}
+OK "$($txt.Length)文字 取得"
+
+Head '今のファイルを控えに取ってから入れ替える'
+$bak = Join-Path $dest ('enote_morning.py.bak_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+Copy-Item $file $bak -Force
+Copy-Item $tmp $file -Force
+OK "控え: $bak"
+OK '入れ替え完了'
+
+Head '試し実行（開かない・通知しない・確認だけ）'
+Push-Location $dest
+try {
+    & $py 'enote_morning.py' '--dry-run' '--force'
+    OK '試し実行が最後まで通りました'
+} catch {
+    NG "試し実行でエラー: $_"
+    NG "元に戻すには: Copy-Item '$bak' '$file' -Force"
+} finally {
+    Pop-Location
+}
+
+Write-Host "`n完了です。次の出勤日（水・金・土）の朝から新しい判定で動きます。" -ForegroundColor Yellow
