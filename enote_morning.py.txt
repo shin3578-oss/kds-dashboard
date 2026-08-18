@@ -15,7 +15,8 @@
      b) なければランチャーHTML生成 → ブラウザで表示（1タップで検索表示）
   4. 結果を LINE WORKS へ通知（lw_notify.yml を workflow_dispatch で起動）
 
-実行環境: 院長メインPC＋持ち歩きノートPCの2台（Task Scheduler、朝）。
+実行環境: 院長メインPC＋持ち歩きノートPCの2台（Task Scheduler、毎日8:20開始・20分おき8時間
+＋ログオン/ロック解除/スリープ復帰。8:00より前は走らない＝院長指示 2026-08-19）。
 このタスクは「そのPCでeNoteを開く」ことが目的のため、PC電源に依存する
 構成が本質的に必要（クラウド移行不可）。失敗時はLINE通知でフォローする。
 どちらのPCから来た通知か分かるよう、通知の見出しにPC名を入れる
@@ -90,6 +91,21 @@ FORCE = "--force" in sys.argv              # 曜日ガード・1日1回ガード
 TARGET_WEEKDAYS = {0, 1, 2, 3, 4, 5}
 # 1日1回だけ実行するためのマーカー（ログオン時トリガーは毎日・複数回発火するため）
 RUN_MARKER = BASE_DIR / "last_run_date.txt"
+
+# この時刻より前は動かさない（院長指示 2026-08-19「朝8時以降にして」）。
+# 毎日トリガーは8:20開始に直したが、ログオン時・ロック解除時・スリープ復帰の
+# 3トリガーは時刻を問わず発火するため、PCを7時台に立ち上げると早朝に走ってしまう。
+# ここで弾いておけば、その日は8:20以降の毎日トリガー（20分おき8時間）が拾う。
+# .env の ENOTE_EARLIEST で "HH:MM" 形式に変更できる。--force / --dry-run では無視。
+def _parse_earliest(raw: str) -> tuple[int, int]:
+    try:
+        hh, mm = raw.split(":")
+        return int(hh), int(mm)
+    except (ValueError, AttributeError):
+        return 8, 0
+
+
+EARLIEST = _parse_earliest(os.environ.get("ENOTE_EARLIEST", "08:00"))
 
 
 def ran_today() -> bool:
@@ -312,6 +328,59 @@ async def fetch_today_targets() -> tuple[list[dict], bool | None]:
 
 
 # ─── eNote ノート解決 ─────────────────────────────────────────
+# 全角数字→半角
+ZEN2HAN = str.maketrans("０１２３４５６７８９", "0123456789")
+# 数字のあとがこれらの文字なら患者ノートではない（「2023年09月22日…」「1号用紙」「3歳以下マニュアル」）
+_NOT_PATIENT_AFTER = "年号歳月日時分秒枚回人"
+_TITLE_HEAD = re.compile(r"^\s*0*(\d+)(.*)$", re.S)
+# 区切りとして使われている文字（半角/全角スペース・アンダースコア・ハイフン各種）
+_SEP_CHARS = " 　_＿-‐‑–—ー―.．:：/／"
+
+
+def title_number(title: str | None) -> str | None:
+    """ノートタイトルの先頭にある診察券番号を返す（患者ノートでなければ None）"""
+    m = _TITLE_HEAD.match((title or "").translate(ZEN2HAN))
+    if not m:
+        return None
+    rest = m.group(2)
+    if rest and rest[0] in _NOT_PATIENT_AFTER:
+        return None
+    return m.group(1)
+
+
+def pick_note(cands: list[tuple[str, str]], patient_name: str):
+    """同じ番号のノートが複数あるときに、どれを開くか決める
+
+    番号の打ち間違いで別患者のノートが同じ番号で並んでいることがある（実測17件）。
+    予約側の患者名と突き合わせ、一致するものを優先する。
+    """
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+
+    name = re.sub(r"[\s　]", "", patient_name or "")
+
+    def score(item):
+        title = re.sub(r"[\s　]", "", item[0])
+        body = title.lstrip("0123456789").lstrip(_SEP_CHARS)
+        s = 0
+        if name:
+            if body == name:
+                s += 100
+            elif name[:2] and name[:2] in body:
+                s += 60
+            elif name[:1] and body.startswith(name[:1]):
+                s += 30
+        if "のコピー" in body:
+            s -= 50          # 複製ノートは本体を優先
+        if body:
+            s += 5           # 名前なし（番号だけ）のノートは後回し
+        return s
+
+    return max(cands, key=score)
+
+
 def resolve_notes(targets: list[dict]) -> None:
     """診察券番号 → eNoteノートタイトル/IDを解決して targets に書き込む"""
     dbs = sorted(glob.glob(str(ENOTE_LOCALSTATE / "sdstorage" / "*" / "MMJSdDriveContentsContext_*.sqlite")),
@@ -333,16 +402,21 @@ def resolve_notes(targets: list[dict]) -> None:
     except OSError:
         pass
 
-    # タイトル先頭の番号でインデックス化（例: 5152_林正宏 / 13832 吉田亜希子）
-    by_num: dict[str, tuple[str, str]] = {}
+    # タイトル先頭の番号でインデックス化
+    # 区切りは統一されていない: 「5152_林正宏」「13832 吉田亜希子」「12594-中川恒二」
+    # 「12876＿田中萌子」、そして区切り無しの「12592庄田昴市」まである。
+    # 区切りを必須にすると区切り無しのノートを取りこぼす（2026-08-19 院長指摘）ので
+    # 数字だけで拾い、患者ノートでないものは後続文字で弾く。
+    by_num: dict[str, list[tuple[str, str]]] = {}
     for title, doc_id in rows:
-        m = re.match(r"^0*(\d+)[_\s]", title or "")
-        if m and m.group(1) not in by_num:
-            by_num[m.group(1)] = (title, doc_id)
+        num = title_number(title)
+        if num:
+            by_num.setdefault(num, []).append((title, doc_id))
 
     for t in targets:
-        num = t["reg"].lstrip("0") or t["reg"]
-        hit = by_num.get(num)
+        num = (t["reg"].lstrip("0") or t["reg"])
+        num = num.translate(ZEN2HAN)
+        hit = pick_note(by_num.get(num, []), t.get("name", ""))
         t["note_title"], t["note_id"] = (hit if hit else (None, None))
 
 
@@ -471,6 +545,11 @@ def main():
     if not FORCE and not DRY_RUN:
         if date.today().weekday() not in TARGET_WEEKDAYS:
             log("日曜のためスキップ")
+            return
+        now = datetime.now()
+        if (now.hour, now.minute) < EARLIEST:
+            log(f"{EARLIEST[0]:02d}:{EARLIEST[1]:02d} より前（今 {now:%H:%M}）のためスキップ。"
+                "この後の毎日トリガーで実行されます")
             return
         if ran_today():
             log("本日は既に実行済みのためスキップ")
