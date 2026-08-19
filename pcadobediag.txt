@@ -1,0 +1,92 @@
+# Acrobatのインストール状態を調べる（読み取りだけ・何も消さない・何も入れない）
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcadobediag.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$out = New-Object System.Collections.Generic.List[string]
+function W($s){ $out.Add($s); Write-Host $s }
+
+W ("=== Acrobatインストール状態の調査  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+W ""
+
+# ---- 1) 登録されている製品とインストール元 ----
+W "■ 登録されている製品"
+$prod = @()
+foreach($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')){
+  Get-ChildItem $k | ForEach-Object {
+    $r = Get-ItemProperty $_.PSPath
+    if($r.DisplayName -match 'Acrobat'){
+      $prod += $_.PSChildName
+      W ("  名前      : {0}" -f $r.DisplayName)
+      W ("  版        : {0}" -f $r.DisplayVersion)
+      W ("  製品コード: {0}" -f $_.PSChildName)
+      W ("  InstallSource : {0}" -f $r.InstallSource)
+      W ("  UninstallString: {0}" -f $r.UninstallString)
+      W ""
+    }
+  }
+}
+
+function Rev($s){ $a = $s.ToCharArray(); [array]::Reverse($a); -join $a }
+
+# ---- 2) Windowsインストーラが記憶している「元ファイル」 ----
+W "■ Windowsインストーラが記憶している元ファイルの場所"
+foreach($g in $prod){
+  if($g -notmatch '^\{'){ continue }
+  # GUID を Installer データベースの圧縮形式に変換する
+  $t = $g.Trim('{','}')
+  $p = $t.Split('-')
+  $packed = (Rev $p[0]) + (Rev $p[1]) + (Rev $p[2]) +
+            (Rev $p[3].Substring(0,2)) + (Rev $p[3].Substring(2,2)) +
+            (Rev $p[4].Substring(0,2)) + (Rev $p[4].Substring(2,2)) +
+            (Rev $p[4].Substring(4,2)) + (Rev $p[4].Substring(6,2)) +
+            (Rev $p[4].Substring(8,2)) + (Rev $p[4].Substring(10,2))
+  $base = "HKLM:\SOFTWARE\Classes\Installer\Products\$packed"
+  W ("  製品 {0}" -f $g)
+  W ("    レジストリ: {0}" -f $(if(Test-Path $base){'あり'}else{'見つからない'}))
+  $sl = "$base\SourceList"
+  if(Test-Path $sl){
+    $s = Get-ItemProperty $sl
+    W ("    PackageName   : {0}" -f $s.PackageName)
+    W ("    LastUsedSource: {0}" -f $s.LastUsedSource)
+    (Get-ItemProperty "$sl\Net").PSObject.Properties |
+      Where-Object { $_.Name -match '^\d+$' } | ForEach-Object {
+        W ("    登録された元フォルダ [{0}]: {1}  → {2}" -f $_.Name, $_.Value,
+            $(if(Test-Path $_.Value){'存在する'}else{'★存在しない'}))
+      }
+  } else { W "    SourceList: 見つからない" }
+
+  # ローカルにキャッシュされた msi
+  $lp = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed\InstallProperties").LocalPackage
+  W ("    LocalPackage  : {0}  → {1}" -f $lp, $(if($lp -and (Test-Path $lp)){'存在する'}else{'★存在しない'}))
+  W ""
+}
+
+# ---- 3) 直近のインストールログからエラー行を拾う ----
+W "■ 直近のインストールログのエラー行"
+$logs = Get-ChildItem $env:TEMP -File -Filter '*.log' |
+        Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-6) } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 6
+if(-not $logs){ W "  直近6時間のログが見つかりません" }
+foreach($l in $logs){
+  W ("  --- {0}  ({1})" -f $l.Name, $l.LastWriteTime.ToString('HH:mm'))
+  Get-Content $l.FullName -Tail 400 |
+    Select-String -Pattern 'error|失敗|1603|1706|1612|Return value 3|cannot|denied' |
+    Select-Object -Last 12 | ForEach-Object { W ("    " + $_.Line.Trim()) }
+}
+W ""
+
+# ---- 4) 残っているファイル ----
+W "■ 残っているAdobeのフォルダ"
+foreach($p in @('C:\Program Files (x86)\Adobe','C:\Program Files\Adobe',
+                'C:\Program Files\Common Files\Adobe','C:\ProgramData\Adobe')){
+  if(Test-Path $p){
+    $mb = [math]::Round(((Get-ChildItem $p -Recurse -File -Force | Measure-Object Length -Sum).Sum)/1MB,0)
+    W ("  {0,6} MB  {1}" -f $mb, $p)
+  }
+}
+W ("  空き: {0} GB" -f [math]::Round((Get-PSDrive C).Free/1GB,1))
+W ""
+W "=== ここまで（何も変更していません）==="
+
+$text = $out -join "`r`n"
+try { Set-Clipboard -Value $text; Write-Host "`n（結果はクリップボードにコピー済み。Ctrl+Vで貼れます）" } catch {}
