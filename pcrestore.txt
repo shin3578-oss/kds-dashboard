@@ -1,0 +1,46 @@
+# システムの復元を有効にして、今の状態の復元ポイントを1つ作る
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcrestore.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $admin){
+  Write-Host "`n  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。`n"
+  return
+}
+
+Write-Host ("=== 復元ポイントを作る  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+Write-Host ("  空き: {0} GB`n" -f [math]::Round((Get-PSDrive C).Free/1GB,1))
+
+Write-Host "【1/4】システムの復元を有効にします" -ForegroundColor Cyan
+Enable-ComputerRestore -Drive 'C:\'
+Write-Host "  完了`n"
+
+Write-Host "【2/4】復元ポイントに使う容量の上限を5%（約11GB）に設定します" -ForegroundColor Cyan
+vssadmin resize shadowstorage /for=C: /on=C: /maxsize=5% | Out-Null
+Write-Host "  完了`n"
+
+Write-Host "【3/4】24時間以内は1つしか作れない制限を一時的に外します" -ForegroundColor Cyan
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+New-ItemProperty -Path $k -Name 'SystemRestorePointCreationFrequency' -Value 0 -PropertyType DWord -Force | Out-Null
+Write-Host "  完了`n"
+
+Write-Host "【4/4】今の状態を復元ポイントとして保存します（1〜3分）" -ForegroundColor Cyan
+Checkpoint-Computer -Description "掃除後の正常な状態 2026-08-19" -RestorePointType 'MODIFY_SETTINGS'
+Start-Sleep -Seconds 3
+
+$rp = Get-ComputerRestorePoint | Sort-Object CreationTime -Descending | Select-Object -First 3
+if($rp){
+  Write-Host "`n  作成できました。今ある復元ポイント:" -ForegroundColor Green
+  $rp | ForEach-Object {
+    $t = [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationTime)
+    Write-Host ("    {0}  {1}" -f $t.ToString('yyyy-MM-dd HH:mm'), $_.Description)
+  }
+} else {
+  Write-Host "`n  ★ 復元ポイントが確認できません。" -ForegroundColor Red
+}
+$vs = (vssadmin list shadowstorage /for=C: 2>$null) -join "`n"
+($vs -split "`n") | Where-Object { $_ -match '使用領域|割り当て|最大領域|Used|Allocated|Maximum' } |
+  ForEach-Object { Write-Host ("  " + $_.Trim()) }
+Write-Host ("`n  空き: {0} GB" -f [math]::Round((Get-PSDrive C).Free/1GB,1))
+Write-Host "`n  この画面をコピーしてClaudeに貼ってください。"
