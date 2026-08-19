@@ -1,0 +1,138 @@
+# 安全に消せるものを掃除し、判断が要るものは調べて報告する
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcclean2.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$out = New-Object System.Collections.Generic.List[string]
+function W($s){ $out.Add($s); Write-Host $s }
+function C($s,$col){ $out.Add($s); Write-Host $s -ForegroundColor $col }
+function MB($p){ $s=(Get-ChildItem $p -Recurse -File -Force|Measure-Object Length -Sum).Sum
+                 if($null -eq $s){0}else{[math]::Round($s/1MB,0)} }
+function FreeGB { [math]::Round((Get-PSDrive C).Free/1GB,1) }
+
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $admin){
+  Write-Host "`n  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。`n"
+  return
+}
+
+$start = FreeGB
+W ("=== 掃除と調査  {0}  ({1}) ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:COMPUTERNAME)
+W ("  開始時の空き: {0} GB" -f $start)
+W ""
+
+# ================= 手順1  安全に消せるもの =================
+C "【1/4】キャッシュ・一時ファイル・使用済みインストーラを削除します" 'Cyan'
+$targets = @(
+ @{p=$env:TEMP;                                                   n='ユーザーの一時ファイル'; kids=$true},
+ @{p='C:\Windows\Temp';                                           n='Windowsの一時ファイル';   kids=$true},
+ @{p="$env:LOCALAPPDATA\Microsoft\Windows\Explorer";              n='サムネイルキャッシュ';     kids=$true},
+ @{p="$env:LOCALAPPDATA\CrashDumps";                              n='クラッシュダンプ';         kids=$true},
+ @{p="$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cache";   n='Chromeキャッシュ';        kids=$true},
+ @{p="$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Cache";  n='Edgeキャッシュ';          kids=$true},
+ @{p="$env:LOCALAPPDATA\pip\cache";                               n='pipキャッシュ';           kids=$true},
+ @{p="$env:LOCALAPPDATA\npm-cache";                               n='npmキャッシュ';           kids=$true},
+ @{p="$env:LOCALAPPDATA\CapCut\User Data\Cache";                  n='CapCutキャッシュ';        kids=$true},
+ @{p="$env:LOCALAPPDATA\..\LocalLow\Intel\ShaderCache";           n='Intelシェーダーキャッシュ'; kids=$true},
+ @{p='C:\Windows\SoftwareDistribution\Download';                  n='Windows Updateの済みDL';  kids=$true}
+)
+$freed = 0
+foreach($t in $targets){
+  if(-not (Test-Path $t.p)){ continue }
+  $m = MB $t.p
+  if($m -lt 20){ continue }
+  Get-ChildItem $t.p -Force | Remove-Item -Recurse -Force
+  $after = MB $t.p
+  $freed += ($m - $after)
+  W ("  {0,6} MB  {1}" -f ($m-$after), $t.n)
+}
+# 使用済みインストーラ（既に入れ終わったもの）
+$exe = "$env:LOCALAPPDATA\BlueSkyBio\Blue Sky Plan\Updates"
+if(Test-Path $exe){
+  $m = MB $exe
+  Get-ChildItem $exe -Force -Filter '*.exe' | Remove-Item -Force
+  $freed += ($m - (MB $exe))
+  W ("  {0,6} MB  BlueSkyPlanの使用済みインストーラ" -f ($m - (MB $exe)))
+}
+# 工場出荷時のカスタマイズ用パッケージ（2018年・通常の利用では使われない）
+$ppkg = 'C:\Recovery\Customizations\usmt.ppkg'
+if(Test-Path $ppkg){
+  $m = [math]::Round((Get-Item $ppkg -Force).Length/1MB,0)
+  takeown /f $ppkg | Out-Null
+  icacls $ppkg /grant "$($env:USERNAME):F" | Out-Null
+  Remove-Item $ppkg -Force
+  if(-not (Test-Path $ppkg)){ $freed += $m; W ("  {0,6} MB  工場出荷時カスタマイズ（usmt.ppkg・2018年）" -f $m) }
+  else { W "  ★ usmt.ppkg は削除できませんでした（そのまま残します）" }
+}
+# ごみ箱
+Clear-RecycleBin -DriveLetter C -Force -ErrorAction SilentlyContinue
+W ("  --- 小計 約 {0} GB  →  空き {1} GB" -f [math]::Round($freed/1024,1), (FreeGB))
+W ""
+
+# ================= 手順2  WinSxS =================
+C "【2/4】Windowsの部品置き場を掃除します（10〜30分かかります）" 'Cyan'
+$b = FreeGB
+dism /online /cleanup-image /startcomponentcleanup /resetbase | Out-Null
+W ("  空き {0} GB → {1} GB （{2} GB 増）" -f $b, (FreeGB), [math]::Round((FreeGB)-$b,1))
+W ""
+
+# ================= 手順3  孤立した更新ファイルの調査（消さない） =================
+C "【3/4】Windows\Installer の孤立ファイルを調べます（削除はしません）" 'Cyan'
+$used = New-Object System.Collections.Generic.HashSet[string]
+Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData' | ForEach-Object {
+  $sid = $_.PSPath
+  # 製品本体のキャッシュ
+  Get-ChildItem "$sid\Products" | ForEach-Object {
+    $lp = (Get-ItemProperty "$($_.PSPath)\InstallProperties").LocalPackage
+    if($lp){ [void]$used.Add($lp.ToLower()) } }
+  # 適用済みパッチのキャッシュ（Products配下ではなくSID直下にある）
+  Get-ChildItem "$sid\Patches" | ForEach-Object {
+    $q = (Get-ItemProperty $_.PSPath).LocalPackage
+    if($q){ [void]$used.Add($q.ToLower()) } }
+}
+$all = Get-ChildItem 'C:\Windows\Installer' -File -Force | Where-Object { $_.Extension -in '.msi','.msp' }
+$orphan = $all | Where-Object { -not $used.Contains($_.FullName.ToLower()) }
+W ("  Installerフォルダ合計 : {0} MB（{1} ファイル）" -f
+    [math]::Round((($all|Measure-Object Length -Sum).Sum)/1MB,0), $all.Count)
+W ("  使用中として登録あり  : {0} ファイル" -f ($all.Count - $orphan.Count))
+W ("  ★孤立（どの製品からも参照されていない）: {0} ファイル / {1} MB" -f
+    $orphan.Count, [math]::Round((($orphan|Measure-Object Length -Sum).Sum)/1MB,0))
+$orphan | Sort-Object Length -Descending | Select-Object -First 10 | ForEach-Object {
+  W ("    {0,6} MB  {1}  {2}" -f [math]::Round($_.Length/1MB,0),
+      $_.LastWriteTime.ToString('yyyy-MM-dd'), $_.Name)
+}
+W ""
+
+# ================= 手順4  判断が要るものの材料 =================
+C "【4/4】判断が要るもの（何もしていません）" 'Cyan'
+$cl = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc"
+if(Test-Path $cl){
+  $last = (Get-ChildItem $cl -Recurse -File -Force | Sort-Object LastWriteTime -Descending |
+           Select-Object -First 1).LastWriteTime
+  W ("  Claudeアプリ    : {0} MB   最後に中身が動いた日 {1}" -f (MB $cl), $last.ToString('yyyy-MM-dd HH:mm'))
+}
+$pfu = "$env:APPDATA\PFU"
+if(Test-Path $pfu){
+  W ("  ScanSnap(PFU)   : {0} MB  内訳" -f (MB $pfu))
+  Get-ChildItem $pfu -Directory -Force -Recurse -Depth 1 | ForEach-Object {
+    $m = MB $_.FullName; if($m -ge 100){ W ("      {0,6} MB  {1}" -f $m, $_.FullName.Replace($pfu,'…')) }
+  }
+  Get-ChildItem $pfu -Recurse -File -Force | Group-Object Extension |
+    Sort-Object { ($_.Group|Measure-Object Length -Sum).Sum } -Descending |
+    Select-Object -First 5 | ForEach-Object {
+      W ("      {0,6} MB  {1,5}個  {2}" -f
+          [math]::Round((($_.Group|Measure-Object Length -Sum).Sum)/1MB,0), $_.Count, $_.Name) }
+}
+$hib = (Get-Item 'C:\hiberfil.sys' -Force).Length
+if($hib){ W ("  休止状態ファイル: {0} MB（無効にすればこのぶん空く）" -f [math]::Round($hib/1MB,0)) }
+$pf = (Get-Item 'C:\pagefile.sys' -Force).Length
+if($pf){ W ("  仮想メモリ      : {0} MB  搭載メモリ {1} GB" -f [math]::Round($pf/1MB,0),
+        [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,0)) }
+$sr = (vssadmin list shadowstorage 2>$null) -join "`n"
+($sr -split "`n") | Where-Object { $_ -match '使用領域|Used' } | ForEach-Object { W ("  システムの復元  : " + $_.Trim()) }
+W ""
+W ("=== 空き: {0} GB → {1} GB ===" -f $start, (FreeGB))
+W "この画面をコピーしてClaudeに貼ってください。"
+
+$text = $out -join "`r`n"
+try { Set-Clipboard -Value $text; Write-Host "`n（結果はクリップボードにコピー済み。Ctrl+Vで貼れます）" } catch {}
