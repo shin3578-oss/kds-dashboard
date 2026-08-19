@@ -1,0 +1,91 @@
+# Acrobat Reader を掃除して入れ直す（更新が失敗し続ける状態の修復）
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcadobefix.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference    = 'Continue'
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $isAdmin){
+  Write-Host ""
+  Write-Host "  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。"
+  Write-Host ""
+  return
+}
+
+$URL  = 'https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2600121771/AcroRdrDC2600121771_ja_JP.exe'
+$SIZE = 627021656
+$EXE  = Join-Path $env:TEMP 'AcroRdrDC2600121771_ja_JP.exe'
+
+function FreeGB { [math]::Round((Get-PSDrive C).Free/1GB,1) }
+$start = FreeGB
+Write-Host ("=== Acrobat修復  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+Write-Host ("  開始時の空き: {0} GB" -f $start)
+Write-Host ""
+
+# ---------- 手順1  溜まった更新ファイルを消す ----------
+Write-Host "【1/4】溜まった更新ファイルを削除します" -ForegroundColor Cyan
+$n = 0
+$arm = 'C:\ProgramData\Adobe\ARM'
+if(Test-Path $arm){
+  Get-ChildItem $arm -Directory -Force -Filter 'Reader_*' | ForEach-Object { $d = $_.FullName
+    @('*.msi','*.msp') | ForEach-Object { Get-ChildItem $d -Recurse -File -Force -Filter $_ } } |
+    ForEach-Object {
+      Remove-Item $_.FullName -Force
+      if(-not (Test-Path $_.FullName)){ $n++ }
+    }
+}
+$tmp = 'C:\ProgramData\Adobe\Temp'
+if(Test-Path $tmp){ Get-ChildItem $tmp -Force | Remove-Item -Recurse -Force }
+Write-Host ("  {0} 個削除 → 空き {1} GB" -f $n, (FreeGB))
+Write-Host ""
+
+# ---------- 手順2  公式インストーラを取得 ----------
+Write-Host "【2/4】Adobe公式から日本語版インストーラを取得します（627MB・数分かかります）" -ForegroundColor Cyan
+if(Test-Path $EXE){ Remove-Item $EXE -Force }
+try {
+  Import-Module BitsTransfer -ErrorAction Stop
+  Start-BitsTransfer -Source $URL -Destination $EXE -Description 'Acrobat Reader'
+} catch {
+  $wc = New-Object System.Net.WebClient
+  $wc.DownloadFile($URL, $EXE)
+}
+$got = (Get-Item $EXE).Length
+if($got -ne $SIZE){
+  Write-Host ("  ダウンロードが不完全です（{0} / {1} バイト）。中止します。" -f $got, $SIZE) -ForegroundColor Red
+  Write-Host "  この画面をコピーしてClaudeに貼ってください。"
+  return
+}
+Write-Host ("  取得完了  {0} MB  正しいサイズを確認しました" -f [math]::Round($got/1MB,0))
+Write-Host ""
+
+# ---------- 手順3  上書きインストール ----------
+Write-Host "【3/4】インストールします。画面が固まったように見えても待ってください（5〜10分）" -ForegroundColor Cyan
+$p = Start-Process -FilePath $EXE -ArgumentList '/sAll','/rs','/msi','EULA_ACCEPT=YES' -Wait -PassThru
+Write-Host ("  インストーラ終了コード: {0}" -f $p.ExitCode)
+if($p.ExitCode -ne 0){
+  Write-Host "  0以外は失敗の可能性があります。次の【4/4】の結果とあわせてClaudeに貼ってください。" -ForegroundColor Yellow
+}
+Write-Host ""
+
+# ---------- 手順4  結果を確認 ----------
+Write-Host "【4/4】結果" -ForegroundColor Cyan
+$keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
+Get-ChildItem $keys | ForEach-Object {
+  $r = Get-ItemProperty $_.PSPath
+  if($r.DisplayName -match 'Acrobat'){
+    Write-Host ("  {0}   バージョン {1}" -f $r.DisplayName, $r.DisplayVersion)
+  }
+}
+$armMB = 0
+if(Test-Path 'C:\ProgramData\Adobe'){
+  $armMB = [math]::Round(((Get-ChildItem 'C:\ProgramData\Adobe' -Recurse -File -Force |
+            Measure-Object Length -Sum).Sum)/1MB,0)
+}
+Write-Host ("  ProgramData\Adobe: {0} MB（12000MB台だった場所）" -f $armMB)
+Remove-Item $EXE -Force
+Write-Host ""
+Write-Host ("  空き: {0} GB → {1} GB" -f $start, (FreeGB)) -ForegroundColor Green
+Write-Host ""
+Write-Host "  この画面をコピーしてClaudeに貼ってください。"
