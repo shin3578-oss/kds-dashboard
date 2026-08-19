@@ -1,0 +1,114 @@
+# 容量を作れる場所を洗い出す（読み取りだけ・何も消さない）
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcbig.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$out = New-Object System.Collections.Generic.List[string]
+function W($s){ $out.Add($s); Write-Host $s }
+function MB($path){
+  $s = (Get-ChildItem $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Measure-Object Length -Sum).Sum
+  if($null -eq $s){ return 0 }
+  return [math]::Round($s/1MB,0)
+}
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+W ("=== 容量を作れる場所の調査  {0}  ({1}) ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:COMPUTERNAME)
+W ("  管理者で実行: {0}" -f $(if($admin){'はい'}else{'いいえ（一部が調べられません）'}))
+$d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+W ("  C: 空き {0} GB / 全体 {1} GB" -f [math]::Round($d.FreeSpace/1GB,1), [math]::Round($d.Size/1GB,1))
+W ""
+
+# ---------- Windowsの大きな隠れファイル ----------
+W "■ Windowsの大きな隠れファイル"
+foreach($f in @('C:\hiberfil.sys','C:\pagefile.sys','C:\swapfile.sys')){
+  $i = Get-Item $f -Force
+  if($i){ W ("  {0,7} MB  {1}" -f [math]::Round($i.Length/1MB,0), $f) }
+}
+if(Test-Path 'C:\Windows.old'){ W ("  {0,7} MB  C:\Windows.old  ← 前のWindowsの残骸" -f (MB 'C:\Windows.old')) }
+$hib = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power').HibernateEnabled
+W ("  休止状態: {0}" -f $(if($hib -eq 1){'有効'}else{'無効'}))
+W ""
+
+# ---------- システムの復元 ----------
+W "■ システムの復元（復元ポイント）"
+if($admin){
+  $vs = (vssadmin list shadowstorage 2>$null) -join "`n"
+  ($vs -split "`n") | Where-Object { $_ -match '使用|割り当て|Used|Allocated|Maximum|最大' } |
+    ForEach-Object { W ("  " + $_.Trim()) }
+  if(-not $vs){ W "  取得できませんでした" }
+} else { W "  （管理者でないため取得できません）" }
+W ""
+
+# ---------- 部品ストア（Windows Update の積み重ね） ----------
+W "■ WinSxS（Windowsの部品置き場）"
+W ("  {0,7} MB  C:\Windows\WinSxS  ※実際の占有はこれより小さい（共有のため）" -f (MB 'C:\Windows\WinSxS'))
+if($admin){
+  W "  --- 掃除でどれだけ減るかWindowsに計算させます（1〜3分）"
+  $an = (dism /online /cleanup-image /analyzecomponentstore 2>$null) -join "`n"
+  ($an -split "`n") | Where-Object { $_ -match '回収可能|Reclaimable|推奨|Recommended|実際のサイズ|Actual Size' } |
+    ForEach-Object { W ("  " + $_.Trim()) }
+} else { W "  （管理者でないため計算できません）" }
+W ""
+
+# ---------- キャッシュ・一時ファイル ----------
+W "■ 消してよいキャッシュ・一時ファイル"
+$cache = @(
+ @{p=$env:TEMP;                                              n='ユーザーの一時ファイル'},
+ @{p='C:\Windows\Temp';                                      n='Windowsの一時ファイル'},
+ @{p='C:\Windows\SoftwareDistribution\Download';             n='Windows Updateのダウンロード済み'},
+ @{p='C:\Windows\Prefetch';                                  n='Prefetch'},
+ @{p='C:\ProgramData\Microsoft\Network\Downloader';          n='配信最適化'},
+ @{p="$env:LOCALAPPDATA\Microsoft\Windows\Explorer";          n='サムネイルキャッシュ'},
+ @{p="$env:LOCALAPPDATA\Microsoft\Windows\INetCache";         n='インターネット一時ファイル'},
+ @{p="$env:LOCALAPPDATA\CrashDumps";                          n='クラッシュダンプ'},
+ @{p="$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cache"; n='Chromeキャッシュ'},
+ @{p="$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Cache"; n='Edgeキャッシュ'},
+ @{p="$env:LOCALAPPDATA\pip\cache";                           n='pipキャッシュ'},
+ @{p="$env:LOCALAPPDATA\npm-cache";                           n='npmキャッシュ'},
+ @{p="$env:APPDATA\npm-cache";                                n='npmキャッシュ2'},
+ @{p="$env:LOCALAPPDATA\ms-playwright";                       n='Playwright（自動化用ブラウザ）'}
+)
+foreach($c in $cache){ if(Test-Path $c.p){ $m = MB $c.p; if($m -ge 50){ W ("  {0,7} MB  {1}" -f $m, $c.n) } } }
+$rb = 0
+Get-ChildItem 'C:\$Recycle.Bin' -Force -Directory | ForEach-Object { $rb += (MB $_.FullName) }
+W ("  {0,7} MB  ごみ箱" -f $rb)
+W ""
+
+# ---------- ストアアプリのデータ ----------
+W "■ ストアアプリのデータ（AppData\Local\Packages）上位10"
+Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Force | ForEach-Object {
+  [pscustomobject]@{ MB = MB $_.FullName; Name = $_.Name }
+} | Sort-Object MB -Descending | Select-Object -First 10 | ForEach-Object {
+  W ("  {0,7} MB  {1}" -f $_.MB, $_.Name)
+}
+W ""
+
+# ---------- 個別に気になるもの ----------
+W "■ 個別"
+foreach($p in @("$env:LOCALAPPDATA\AnthropicClaude", "$env:APPDATA\Claude", "$env:USERPROFILE\.claude",
+                "$env:USERPROFILE\.cache", "$env:APPDATA\PFU", "$env:LOCALAPPDATA\PFU",
+                "$env:USERPROFILE\Downloads", "$env:USERPROFILE\OneDrive")){
+  if(Test-Path $p){ W ("  {0,7} MB  {1}" -f (MB $p), $p) }
+}
+W ""
+
+W "■ Downloads の大きいファイル 上位12"
+Get-ChildItem "$env:USERPROFILE\Downloads" -Recurse -File -Force |
+  Sort-Object Length -Descending | Select-Object -First 12 | ForEach-Object {
+    W ("  {0,6} MB  {1}  {2}" -f [math]::Round($_.Length/1MB,0),
+        $_.LastWriteTime.ToString('yyyy-MM-dd'), $_.Name)
+  }
+W ""
+
+W "■ Cドライブ全体で 300MB を超えるファイル 上位20"
+Get-ChildItem C:\ -Recurse -File -Force -ErrorAction SilentlyContinue |
+  Where-Object { $_.Length -gt 300MB } |
+  Sort-Object Length -Descending | Select-Object -First 20 | ForEach-Object {
+    W ("  {0,6} MB  {1}  {2}" -f [math]::Round($_.Length/1MB,0),
+        $_.LastWriteTime.ToString('yyyy-MM-dd'), $_.FullName)
+  }
+W ""
+W "=== ここまで（何も削除していません）==="
+
+$text = $out -join "`r`n"
+try { Set-Clipboard -Value $text; Write-Host "`n（結果はクリップボードにコピー済み。Ctrl+Vで貼れます）" } catch {}
