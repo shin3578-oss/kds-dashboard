@@ -1,0 +1,64 @@
+# Acrobatの更新一時ファイルだけを削除する
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcadobeclean.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $isAdmin){
+  Write-Host ""
+  Write-Host "  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  PowerShellを閉じて、スタートボタンを右クリック →"
+  Write-Host "  「ターミナル（管理者）」を選び、もう一度同じ1行を貼ってください。"
+  Write-Host ""
+  return
+}
+
+$before = (Get-PSDrive C).Free
+Write-Host ("=== Acrobat更新ファイルの掃除  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+Write-Host ("  開始時の空き: {0} GB" -f [math]::Round($before/1GB,1))
+Write-Host ""
+
+$deleted = 0
+$freed   = 0
+
+# 1) ARM\Reader_* の中の更新インストーラ（.msi / .msp）だけを消す。
+#    ARM\S（ARM自身の更新用）とフォルダ構造は触らない
+$arm = 'C:\ProgramData\Adobe\ARM'
+if(Test-Path $arm){
+  $targets = Get-ChildItem $arm -Directory -Force -Filter 'Reader_*' -ErrorAction SilentlyContinue
+  $targets | ForEach-Object { $d = $_.FullName
+      @('*.msi','*.msp') | ForEach-Object { Get-ChildItem $d -Recurse -File -Force -Filter $_ -ErrorAction SilentlyContinue } } |
+    ForEach-Object {
+      $mb = [math]::Round($_.Length/1MB,0)
+      Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+      if(-not (Test-Path $_.FullName)){
+        $deleted++; $freed += $mb
+        Write-Host ("  削除  {0,6} MB  {1}" -f $mb, $_.Name)
+      } else {
+        Write-Host ("  ★使用中のため残しました  {0}" -f $_.Name) -ForegroundColor Yellow
+      }
+    }
+}
+
+# 2) Adobeの作業用Tempの中身
+$tmp = 'C:\ProgramData\Adobe\Temp'
+if(Test-Path $tmp){
+  $mb = [math]::Round(((Get-ChildItem $tmp -Recurse -File -Force |
+        Measure-Object Length -Sum).Sum)/1MB,0)
+  Get-ChildItem $tmp -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  $freed += $mb
+  Write-Host ("  削除  {0,6} MB  ProgramData\Adobe\Temp の中身" -f $mb)
+}
+
+Start-Sleep -Seconds 2
+$after = (Get-PSDrive C).Free
+Write-Host ""
+Write-Host ("  削除したファイル: {0} 個" -f $deleted)
+Write-Host ("  空き: {0} GB → {1} GB （{2} GB 増）" -f
+    [math]::Round($before/1GB,1), [math]::Round($after/1GB,1),
+    [math]::Round(($after-$before)/1GB,1)) -ForegroundColor Green
+Write-Host ""
+Write-Host "  残したもの: Acrobat本体・設定・OnDemand・Setup（何も壊していません）"
+Write-Host ""
+Write-Host "  【このあと必ず】Acrobatを開いて メニュー→ヘルプ→アップデートの有無をチェック"
+Write-Host "  更新が適用できていないのが溜まった原因なので、一度手で完了させてください。"
