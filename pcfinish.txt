@@ -1,0 +1,66 @@
+# Claudeアプリを削除して、仕上げに復元ポイントを作る
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcfinish.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $admin){
+  Write-Host "`n  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。`n"
+  return
+}
+function FreeGB { [math]::Round((Get-PSDrive C).Free/1GB,1) }
+$start = FreeGB
+Write-Host ("=== 仕上げ  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+Write-Host ("  開始時の空き: {0} GB`n" -f $start)
+
+# ---------- 1/4  Claudeアプリを削除 ----------
+Write-Host "【1/4】Claudeアプリを削除します" -ForegroundColor Cyan
+Get-Process claude,Claude -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Seconds 2
+$pkg = Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq 'Claude_pzs8sxrjxfjjc' }
+if($pkg){
+  Write-Host ("  見つかりました: {0}  {1}" -f $pkg.Name, $pkg.Version)
+  Remove-AppxPackage -Package $pkg.PackageFullName
+  Start-Sleep -Seconds 3
+  if(Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq 'Claude_pzs8sxrjxfjjc' }){
+    Write-Host "  ★ アンインストールに失敗しました" -ForegroundColor Red
+  } else { Write-Host "  アンインストールしました" }
+} else { Write-Host "  Claudeアプリは見つかりませんでした（すでに無いようです）" }
+
+# 残ったデータフォルダ（仮想マシンのディスクなど）
+$left = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc"
+if(Test-Path $left){
+  $mb = [math]::Round(((Get-ChildItem $left -Recurse -File -Force | Measure-Object Length -Sum).Sum)/1MB,0)
+  Remove-Item $left -Recurse -Force
+  if(Test-Path $left){ Write-Host ("  ★ 残ったデータ {0} MB を消せませんでした" -f $mb) -ForegroundColor Yellow }
+  else { Write-Host ("  残っていたデータ {0} MB も削除しました" -f $mb) }
+}
+Write-Host ("  → 空き {0} GB`n" -f (FreeGB))
+
+# ---------- 2/4  システムの復元を有効化 ----------
+Write-Host "【2/4】システムの復元を有効にし、上限を5%に設定します" -ForegroundColor Cyan
+Enable-ComputerRestore -Drive 'C:\'
+vssadmin resize shadowstorage /for=C: /on=C: /maxsize=5% | Out-Null
+Write-Host "  完了`n"
+
+# ---------- 3/4  作成頻度の制限を外す ----------
+Write-Host "【3/4】24時間に1つの制限を外します" -ForegroundColor Cyan
+New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' `
+  -Name 'SystemRestorePointCreationFrequency' -Value 0 -PropertyType DWord -Force | Out-Null
+Write-Host "  完了`n"
+
+# ---------- 4/4  復元ポイントを作る ----------
+Write-Host "【4/4】今の状態を復元ポイントとして保存します（1〜3分）" -ForegroundColor Cyan
+Checkpoint-Computer -Description "掃除後の正常な状態 2026-08-19" -RestorePointType 'MODIFY_SETTINGS'
+Start-Sleep -Seconds 3
+$rp = Get-ComputerRestorePoint | Sort-Object CreationTime -Descending | Select-Object -First 3
+if($rp){
+  Write-Host "`n  作成できました:" -ForegroundColor Green
+  $rp | ForEach-Object {
+    $t = [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationTime)
+    Write-Host ("    {0}  {1}" -f $t.ToString('yyyy-MM-dd HH:mm'), $_.Description)
+  }
+} else { Write-Host "`n  ★ 復元ポイントが確認できません" -ForegroundColor Red }
+
+Write-Host ("`n=== 空き: {0} GB → {1} GB ===" -f $start, (FreeGB)) -ForegroundColor Green
+Write-Host "この画面をコピーしてClaudeに貼ってください。"
