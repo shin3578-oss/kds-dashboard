@@ -1,0 +1,115 @@
+# Acrobat Reader を修復する：インストール元を復元 → 削除 → 新規インストール
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcadoberepair.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $isAdmin){
+  Write-Host "`n  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。`n"
+  return
+}
+
+$GUID = '{AC76BA86-7AD7-1041-7B44-AC0F074E4100}'
+$SRC  = "C:\ProgramData\Adobe\Setup\$GUID"
+$URL  = 'https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2600121771/AcroRdrDC2600121771_ja_JP.exe'
+$SIZE = 627021656
+$EXE  = Join-Path $env:TEMP 'AcroRdrDC2600121771_ja_JP.exe'
+$LOG  = Join-Path $env:TEMP 'acro_uninstall.log'
+
+function FreeGB { [math]::Round((Get-PSDrive C).Free/1GB,1) }
+function ProductCodeOf($msi){
+  # MSIの中身を開いて ProductCode を読む（別製品のファイルを掴んでいないか確かめる）
+  try {
+    $i  = New-Object -ComObject WindowsInstaller.Installer
+    $db = $i.GetType().InvokeMember('OpenDatabase','InvokeMethod',$null,$i,@($msi,0))
+    $v  = $db.GetType().InvokeMember('OpenView','InvokeMethod',$null,$db,
+            @("SELECT Value FROM Property WHERE Property='ProductCode'"))
+    $v.GetType().InvokeMember('Execute','InvokeMethod',$null,$v,$null) | Out-Null
+    $r  = $v.GetType().InvokeMember('Fetch','InvokeMethod',$null,$v,$null)
+    return $r.GetType().InvokeMember('StringData','GetProperty',$null,$r,1)
+  } catch { return $null }
+}
+
+$start = FreeGB
+Write-Host ("=== Acrobat修復  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+Write-Host ("  開始時の空き: {0} GB`n" -f $start)
+
+# ---------- 1/5  インストール元を復元 ----------
+Write-Host "【1/5】失われたインストール元を復元します" -ForegroundColor Cyan
+# C:\Windows\Installer のMSIを1つずつ開いて、製品コードが一致するものを探す（数秒）
+$cand = @(Get-ChildItem 'C:\Windows\Installer' -File -Filter '*.msi' -Force |
+          ForEach-Object { if((ProductCodeOf $_.FullName) -eq $GUID){ $_ } })
+if(-not $cand){
+  Write-Host "  ★ 一致するキャッシュが見つかりませんでした。ここで中止します。" -ForegroundColor Red
+  Write-Host "  この画面をコピーしてClaudeに貼ってください。"
+  return
+}
+$msi = $cand[0]
+Write-Host ("  見つかりました: {0}  ({1} MB)" -f $msi.Name, [math]::Round($msi.Length/1MB,1))
+Write-Host ("  製品コードの一致を確認: {0}" -f $GUID)
+New-Item -ItemType Directory -Path $SRC -Force | Out-Null
+Copy-Item $msi.FullName (Join-Path $SRC 'AcroRead.msi') -Force
+if(-not (Test-Path (Join-Path $SRC 'AcroRead.msi'))){
+  Write-Host "  ★ 復元に失敗しました。中止します。" -ForegroundColor Red; return
+}
+Write-Host ("  復元しました → {0}\AcroRead.msi`n" -f $SRC)
+
+# ---------- 2/5  今のReaderを削除 ----------
+Write-Host "【2/5】壊れているReaderを削除します（数分）" -ForegroundColor Cyan
+Get-Process AcroRd32,Acrobat,AcroCEF,AdobeARM,Reader_sl | Stop-Process -Force
+$p = Start-Process msiexec.exe -ArgumentList "/x$GUID","/qn","/norestart","/L*v","`"$LOG`"" -Wait -PassThru
+Write-Host ("  終了コード: {0}" -f $p.ExitCode)
+$still = (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$GUID") -or
+         (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$GUID")
+if($still){
+  Write-Host "  ★ まだ登録が残っています。削除に失敗しました。ログの要点:" -ForegroundColor Red
+  Get-Content $LOG -Tail 300 | Select-String 'エラー|Error|1706|1612|Return value 3' |
+    Select-Object -Last 8 | ForEach-Object { Write-Host ("    " + $_.Line.Trim()) }
+  Write-Host "  この画面をコピーしてClaudeに貼ってください。ここで中止します。"
+  return
+}
+Write-Host ("  削除できました → 空き {0} GB`n" -f (FreeGB))
+
+# ---------- 3/5  公式インストーラを取得 ----------
+Write-Host "【3/5】Adobe公式から日本語版を取得します（627MB・数分）" -ForegroundColor Cyan
+if(Test-Path $EXE){ Remove-Item $EXE -Force }
+try { Import-Module BitsTransfer -ErrorAction Stop
+      Start-BitsTransfer -Source $URL -Destination $EXE -Description 'Acrobat Reader' }
+catch { (New-Object System.Net.WebClient).DownloadFile($URL,$EXE) }
+$got = (Get-Item $EXE).Length
+if($got -ne $SIZE){
+  Write-Host ("  ★ ダウンロードが不完全（{0}/{1}バイト）。中止します。" -f $got,$SIZE) -ForegroundColor Red
+  Write-Host "  ※Readerは削除済みです。この画面を貼ってください、入れ直しを続けます。"
+  return
+}
+Write-Host ("  取得完了  {0} MB  サイズ一致`n" -f [math]::Round($got/1MB,0))
+
+# ---------- 4/5  新規インストール ----------
+Write-Host "【4/5】インストールします（5〜10分・固まって見えても待ってください）" -ForegroundColor Cyan
+$q = Start-Process $EXE -ArgumentList '/sAll','/rs','/msi','EULA_ACCEPT=YES' -Wait -PassThru
+Write-Host ("  終了コード: {0}`n" -f $q.ExitCode)
+
+# ---------- 5/5  結果 ----------
+Write-Host "【5/5】結果" -ForegroundColor Cyan
+$ok = $false
+foreach($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')){
+  Get-ChildItem $k | ForEach-Object {
+    $r = Get-ItemProperty $_.PSPath
+    if($r.DisplayName -match 'Acrobat'){
+      $ok = $true
+      Write-Host ("  {0}   バージョン {1}" -f $r.DisplayName, $r.DisplayVersion) -ForegroundColor Green
+    }
+  }
+}
+if(-not $ok){ Write-Host "  ★ インストールが確認できません。" -ForegroundColor Red }
+$mb = 0
+if(Test-Path 'C:\ProgramData\Adobe'){
+  $mb = [math]::Round(((Get-ChildItem 'C:\ProgramData\Adobe' -Recurse -File -Force |
+        Measure-Object Length -Sum).Sum)/1MB,0)
+}
+Write-Host ("  ProgramData\Adobe: {0} MB" -f $mb)
+Remove-Item $EXE -Force
+Write-Host ("  空き: {0} GB → {1} GB" -f $start,(FreeGB)) -ForegroundColor Green
+Write-Host "`n  この画面をコピーしてClaudeに貼ってください。"
