@@ -1,0 +1,85 @@
+# ノートPCの容量を実測する（読み取りだけ・何も消さない）
+# 実行: irm https://shin3578-oss.github.io/kds-dashboard/pccheck.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$out = New-Object System.Collections.Generic.List[string]
+function W($s){ $out.Add($s); Write-Host $s }
+
+function Size($path){
+  if(-not (Test-Path $path)){ return -1 }
+  $s = (Get-ChildItem $path -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Measure-Object Length -Sum).Sum
+  if($null -eq $s){ return 0 }
+  return [math]::Round($s/1MB,0)
+}
+
+W ("=== PC容量チェック  {0}  ({1}) ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:COMPUTERNAME)
+W ""
+
+# --- ドライブの空き ---
+W "■ ドライブの空き"
+Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+  W ("  {0} 空き {1} GB / 全体 {2} GB" -f $_.DeviceID,
+      [math]::Round($_.FreeSpace/1GB,1), [math]::Round($_.Size/1GB,1))
+}
+W ""
+
+# --- Adobe関連の実サイズ ---
+W "■ Adobe（Acrobat）の実サイズ"
+$adobe = @(
+  'C:\Program Files\Adobe',
+  'C:\Program Files (x86)\Adobe',
+  'C:\Program Files\Common Files\Adobe',
+  'C:\Program Files (x86)\Common Files\Adobe',
+  'C:\ProgramData\Adobe',
+  "$env:LOCALAPPDATA\Adobe",
+  "$env:APPDATA\Adobe"
+)
+$tot = 0
+foreach($p in $adobe){
+  $mb = Size $p
+  if($mb -lt 0){ continue }
+  $tot += $mb
+  W ("  {0,8} MB  {1}" -f $mb, $p)
+}
+W ("  ---- Adobe合計 {0} MB （約 {1} GB）" -f $tot, [math]::Round($tot/1024,2))
+W ""
+
+# --- Windowsが「サイズ」として登録している申告値 ---
+W "■ Windowsが登録している申告サイズ（設定画面はこれを表示する）"
+$keys = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+          'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+Get-ChildItem $keys -ErrorAction SilentlyContinue | ForEach-Object {
+  $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+  if($p.DisplayName -match 'Acrobat|Adobe'){
+    W ("  {0,8} MB  {1}" -f [math]::Round($p.EstimatedSize/1024,0), $p.DisplayName)
+  }
+}
+W ""
+
+# --- 本当に容量を食っている場所 上位15 ---
+W "■ 本当に容量を食っているフォルダ 上位15"
+$roots = @('C:\Program Files','C:\Program Files (x86)','C:\ProgramData',
+           "$env:LOCALAPPDATA","$env:APPDATA","$env:USERPROFILE")
+$rows = foreach($r in $roots){
+  Get-ChildItem $r -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $mb = Size $_.FullName
+    if($mb -gt 500){ [pscustomobject]@{ MB=$mb; Path=$_.FullName } }
+  }
+}
+$rows | Sort-Object MB -Descending | Select-Object -First 15 | ForEach-Object {
+  W ("  {0,8} MB  {1}" -f $_.MB, $_.Path)
+}
+W ""
+
+# --- 消してよい一時ファイル ---
+W "■ 掃除できる一時ファイル（今回は消していません）"
+foreach($p in @($env:TEMP,'C:\Windows\Temp','C:\Windows\SoftwareDistribution\Download')){
+  $mb = Size $p
+  if($mb -ge 0){ W ("  {0,8} MB  {1}" -f $mb, $p) }
+}
+W ""
+W "=== ここまで。この画面をコピーしてClaudeに貼ってください ==="
+
+$text = $out -join "`r`n"
+try { Set-Clipboard -Value $text; Write-Host "`n（結果はクリップボードにコピー済み。Claudeの入力欄で Ctrl+V で貼れます）" } catch {}
