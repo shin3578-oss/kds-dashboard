@@ -1,0 +1,64 @@
+# Windows\Installer の孤立ファイルを削除する（どの製品からも参照されていないものだけ）
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/pcorphan.txt | iex
+$ErrorActionPreference = 'SilentlyContinue'
+$out = New-Object System.Collections.Generic.List[string]
+function W($s){ $out.Add($s); Write-Host $s }
+function FreeGB { [math]::Round((Get-PSDrive C).Free/1GB,1) }
+
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $admin){
+  Write-Host "`n  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。`n"
+  return
+}
+
+$start = FreeGB
+W ("=== 孤立した更新ファイルの削除  {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+W ("  開始時の空き: {0} GB" -f $start)
+W ""
+
+# --- 参照されているファイルを集める（削除の直前に取り直す） ---
+$used = New-Object System.Collections.Generic.HashSet[string]
+Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData' | ForEach-Object {
+  $sid = $_.PSPath
+  Get-ChildItem "$sid\Products" | ForEach-Object {
+    $lp = (Get-ItemProperty "$($_.PSPath)\InstallProperties").LocalPackage
+    if($lp){ [void]$used.Add($lp.ToLower()) } }
+  Get-ChildItem "$sid\Patches" | ForEach-Object {
+    $q = (Get-ItemProperty $_.PSPath).LocalPackage
+    if($q){ [void]$used.Add($q.ToLower()) } }
+}
+W ("  参照登録されているファイル: {0} 件" -f $used.Count)
+if($used.Count -lt 20){
+  W "  ★ 参照リストが少なすぎます。読み取りに失敗した可能性があるため中止します。"
+  return
+}
+
+$all    = Get-ChildItem 'C:\Windows\Installer' -File -Force | Where-Object { $_.Extension -in '.msi','.msp' }
+$orphan = @($all | Where-Object { -not $used.Contains($_.FullName.ToLower()) })
+W ("  Installer内: {0} 件 / {1} MB" -f $all.Count, [math]::Round((($all|Measure-Object Length -Sum).Sum)/1MB,0))
+W ("  孤立: {0} 件 / {1} MB" -f $orphan.Count, [math]::Round((($orphan|Measure-Object Length -Sum).Sum)/1MB,0))
+W ""
+
+# --- 削除（使用中で消せないものは残す） ---
+$del = 0; $mb = 0; $skip = 0
+foreach($f in $orphan){
+  $size = [math]::Round($f.Length/1MB,0)
+  Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+  if(Test-Path $f.FullName){ $skip++; W ("  使用中のため残しました: {0}" -f $f.Name) }
+  else { $del++; $mb += $size }
+}
+W ("  削除: {0} 件 / {1} MB　残した: {2} 件" -f $del, $mb, $skip)
+W ""
+
+# --- あとかたづけの確認 ---
+$acro = (Get-ChildItem 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' |
+         ForEach-Object { (Get-ItemProperty $_.PSPath).DisplayName } | Where-Object { $_ -match 'Acrobat' })
+W ("  インストール済み製品の一覧が読めるか: {0}" -f $(if($acro){'はい（' + $acro + '）'}else{'いいえ'}))
+W ""
+W ("=== 空き: {0} GB → {1} GB （{2} GB 増）===" -f $start, (FreeGB), [math]::Round((FreeGB)-$start,1))
+W "この画面をコピーしてClaudeに貼ってください。"
+
+$text = $out -join "`r`n"
+try { Set-Clipboard -Value $text } catch {}
