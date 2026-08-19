@@ -1,0 +1,97 @@
+# 留守番エージェントをこのPCに設置する
+# 実行（管理者のPowerShellで）: irm https://shin3578-oss.github.io/kds-dashboard/agentsetup.txt | iex
+$ErrorActionPreference = 'Stop'
+function Step($n,$m){ Write-Host "`n■ [$n] $m" -ForegroundColor Cyan }
+function OK($m){ Write-Host "   OK  $m" -ForegroundColor Green }
+function NG($m){ Write-Host "   NG  $m" -ForegroundColor Red }
+
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if(-not $admin){
+  Write-Host "`n  管理者として実行されていません。" -ForegroundColor Yellow
+  Write-Host "  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。`n"
+  return
+}
+
+Write-Host ("=== 留守番エージェントの設置  {0}  ({1}) ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $env:COMPUTERNAME)
+
+# --- 1. .env のトークンを確認 ---
+Step 1 'GitHubのトークンを確認'
+$envFile = Join-Path $env:USERPROFILE 'Desktop\AI\.env'
+if(-not (Test-Path $envFile)){ NG "$envFile がありません。eノート朝の準備が設置されていないPCのようです。"; return }
+$PAT = $null
+foreach($l in Get-Content $envFile -Encoding UTF8){
+  if($l -match '^\s*GITHUB_PAT\s*=\s*(.+?)\s*$'){ $PAT = $Matches[1].Trim('"',"'") }
+}
+if(-not $PAT){ NG 'GITHUB_PAT が .env にありません'; return }
+$H = @{ Authorization = "Bearer $PAT"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'kds-agent' }
+$who = Invoke-RestMethod -Uri 'https://api.github.com/user' -Headers $H -TimeoutSec 30
+OK "トークンは有効です（$($who.login)）"
+
+# --- 2. 本体を取ってくる ---
+Step 2 'エージェント本体を取得'
+$dest = Join-Path $env:USERPROFILE 'Desktop\AI\agent'
+New-Item -ItemType Directory -Path $dest -Force | Out-Null
+$meta = Invoke-RestMethod -Uri 'https://api.github.com/repos/shin3578-oss/kds-agent/contents/runner/agent_runner.ps1' -Headers $H -TimeoutSec 60
+$src  = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($meta.content -replace "\s",'')))
+$file = Join-Path $dest 'agent_runner.ps1'
+[IO.File]::WriteAllText($file, $src, (New-Object Text.UTF8Encoding $true))
+OK "$file （$([math]::Round($src.Length/1KB,1)) KB）"
+
+# --- 3. タスクスケジューラに登録 ---
+Step 3 'タスクスケジューラに登録'
+$NS = 'Root/Microsoft/Windows/TaskScheduler'
+$taskName = 'KDS-Agent'
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+  -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $file + '"') -WorkingDirectory $dest
+try {
+  $sid = ([Security.Principal.NTAccount]"$env:USERDOMAIN\$env:USERNAME").Translate([Security.Principal.SecurityIdentifier]).Value
+} catch { $sid = $null }
+
+$tLogon = New-ScheduledTaskTrigger -AtLogOn
+if($sid){ $tLogon.UserId = $sid }
+$tLogon.Delay = 'PT90S'          # ネットが立ち上がるのを待つ（eノートの後に動くよう長めに）
+
+$tUnlock = $null
+try {
+  $tUnlock = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskSessionStateChangeTrigger -Namespace $NS) -ClientOnly
+  $tUnlock.StateChange = 8
+  $tUnlock.UserId = if($sid){ $sid } else { "$env:USERDOMAIN\$env:USERNAME" }
+  $tUnlock.Delay = 'PT90S'; $tUnlock.Enabled = $true
+} catch { $tUnlock = $null }
+
+$tWake = $null
+try {
+  $tWake = New-CimInstance -CimClass (Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace $NS) -ClientOnly
+  $tWake.Subscription = "<QueryList><Query Id='0' Path='System'><Select Path='System'>*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]</Select></Query></QueryList>"
+  $tWake.Delay = 'PT2M'; $tWake.Enabled = $true
+} catch { $tWake = $null }
+
+$tHourly = New-ScheduledTaskTrigger -Daily -At '8:30AM'
+$tHourly.Repetition = (New-ScheduledTaskTrigger -Once -At '8:30AM' `
+  -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 12)).Repetition
+
+$triggers = @($tLogon)
+if($tUnlock){ $triggers += $tUnlock }
+if($tWake)  { $triggers += $tWake }
+$triggers += $tHourly
+
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+$principal = if($sid){ New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Highest }
+             else    { New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest }
+
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Settings $settings `
+  -Principal $principal -Force `
+  -Description '留守番エージェント｜ログオン時・ロック解除時・スリープ復帰時・8:30から1時間おきに12時間｜非公開リポジトリ kds-agent の pending/<PC名>/ に置かれた指示を実行し、結果を results/<PC名>/ に書き戻して院長のLINEワークスDMに1通知らせる。指示が無ければ何もせず終わる。' | Out-Null
+OK "登録しました: $taskName（トリガー $($triggers.Count) 本・管理者権限で実行）"
+
+# --- 4. その場で1回動かす ---
+Step 4 'その場で1回動かして確かめます'
+& powershell -NoProfile -ExecutionPolicy Bypass -File $file
+OK '実行しました'
+
+Write-Host "`n=== 設置完了 ===" -ForegroundColor Green
+Write-Host "  これ以降、このPCを開くたびに指示を見に行きます。"
+Write-Host "  止めたいとき: $dest\DISABLED という空ファイルを作る"
+Write-Host "`n  この画面をコピーしてClaudeに貼ってください。"
