@@ -8,7 +8,7 @@
 #   2) 受付PCの今のIPを実測し、証明書がそのIP向けか確認（違えば作り直し）
 #   3) 院内CA(rootCA.pem)を配信フォルダへ設置  ← 「DLできない」の直接の原因
 #   4) 警告の出ないHTTP(3001番)で「証明書の入れ方ページ」を公開
-#   5) ファイアウォール許可・PC起動時の自動起動を設定
+#   5) ファイアウォール許可・自動起動・10分おきの自動復帰・受信の自動開始
 #   6) 実際にダウンロードできるところまで検証して結果を表示
 # ==========================================================
 $ErrorActionPreference = 'Stop'
@@ -123,7 +123,7 @@ try {
   if ($needNew) {
     if (-not (Test-Path (Join-Path $root 'certs'))) { New-Item -ItemType Directory -Path (Join-Path $root 'certs') | Out-Null }
     & $mk -key-file 'certs\key.pem' -cert-file 'certs\cert.pem' $ip 'localhost' '127.0.0.1' 2>&1 | Out-Null
-    if (Test-Path $certFile) { OK "証明書を $ip 向けに作り直しました（iPadは証明書を入れ直す必要があります）" }
+    if (Test-Path $certFile) { OK "証明書を $ip 向けに作り直しました（院内CAは同じなので、iPadの証明書は入れ直し不要。新しいURLで開き直すだけ）" }
     else { NG '証明書の作成に失敗しました'; return }
   }
 } finally { Pop-Location }
@@ -263,43 +263,115 @@ foreach ($p in 3000, 3001) {
   } else { OK "$p 番はすでに許可済み" }
 }
 
-# --- 7. 起動 & 自動起動 -----------------------------------------------------
-Step 7 'サーバーを起動し、PC起動時に自動で立ち上がるようにする'
-$cmd = Join-Path $root 'start_call.cmd'
-$cmdBody = @"
-@echo off
-cd /d "$root"
-start "" /min "$nodeExe" server.js
-start "" /min "$nodeExe" cert-share.js
+# --- 7. 自動起動と自動復帰（見張り役）------------------------------------
+Step 7 'PC起動時の自動立ち上げと、落ちたときの自動復帰を設定する'
+
+# 受付PC用「押さなくても受信が始まる」ページ（既存ファイルは書き換えない）
+$autoHtml = Join-Path $root 'public\reception-auto.html'
+$recepHtml = Join-Path $root 'public\reception.html'
+if (Test-Path $recepHtml) {
+  $h = Get-Content $recepHtml -Raw -Encoding UTF8
+  $inject = @'
+  <script>
+    // 受付PC専用。ブラウザの自動再生制限を外して起動しているので、
+    // 毎朝の「受信開始」を人が押さなくても受信状態に入れる。
+    window.addEventListener('load', function () {
+      var b = document.getElementById('startBtn');
+      if (b) { setTimeout(function () { b.click(); }, 300); }
+    });
+  </script>
+</body>
+'@
+  $h2 = $h -replace '</body>', $inject
+  Set-Content -Path $autoHtml -Value $h2 -Encoding UTF8
+  OK '作成: public\reception-auto.html（受信開始を押さなくてよい受付用ページ）'
+} else {
+  WARN 'reception.html が見つからないため、受信の自動開始は設定しません'
+}
+
+# ブラウザを探す（自動再生の制限を外して起動する必要がある）
+$browser = $null
+foreach ($b in @(
+  "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+  "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+  "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+  "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+  "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe")) {
+  if (Test-Path $b) { $browser = $b; break }
+}
+if ($browser) { OK "受付画面に使うブラウザ: $browser" }
+else { WARN 'ChromeもEdgeも見つかりません。受信画面は手で開いてください' }
+
+# 見張り役（10分おきに走り、落ちていたら起こし直す）
+$watch = Join-Path $root 'watchdog.ps1'
+$w = @"
+# 院内呼び出し 見張り役: サーバーと受付画面が落ちていたら起こし直す
+# 止めたいときは、このフォルダに DISABLED という名前の空ファイルを作る
+`$root    = '$root'
+`$nodeExe = '$nodeExe'
+`$browser = '$browser'
+`$ip      = '$ip'
+`$profile = Join-Path `$env:LOCALAPPDATA 'KDS-ClinicCall-Browser'
+
+if (Test-Path (Join-Path `$root 'DISABLED')) { return }
+
+function PortUp(`$port) {
+  try { return [bool](Get-NetTCPConnection -LocalPort `$port -State Listen -ErrorAction SilentlyContinue) }
+  catch { return `$false }
+}
+
+if (-not (PortUp 3000)) {
+  Start-Process -FilePath `$nodeExe -ArgumentList 'server.js' -WorkingDirectory `$root -WindowStyle Minimized
+  Start-Sleep -Seconds 3
+}
+if (-not (PortUp 3001)) {
+  Start-Process -FilePath `$nodeExe -ArgumentList 'cert-share.js' -WorkingDirectory `$root -WindowStyle Minimized
+  Start-Sleep -Seconds 2
+}
+
+if (`$browser -and (Test-Path (Join-Path `$root 'public\reception-auto.html'))) {
+  # 専用プロファイルで開く。ふだん使いのChromeとは別プロセスにしないと
+  # 「自動再生を許可」の指定が効かないため
+  `$alive = Get-CimInstance Win32_Process -Filter "Name='`$(Split-Path `$browser -Leaf)'" -ErrorAction SilentlyContinue |
+           Where-Object { `$_.CommandLine -like '*KDS-ClinicCall-Browser*' }
+  if (-not `$alive) {
+    Start-Process -FilePath `$browser -ArgumentList @(
+      '--user-data-dir=' + `$profile,
+      '--autoplay-policy=no-user-gesture-required',
+      '--no-first-run', '--no-default-browser-check',
+      '--app=https://' + `$ip + ':3000/reception-auto.html'
+    )
+  }
+}
 "@
-Set-Content -Path $cmd -Value $cmdBody -Encoding Default
-OK "起動用: start_call.cmd"
+Set-Content -Path $watch -Value $w -Encoding UTF8
+OK '作成: watchdog.ps1（10分おきに生死を確認して起こし直す）'
 
 $taskName = 'KDS-ClinicCall'
 try {
   if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
   }
-  $a = New-ScheduledTaskAction -Execute $cmd
-  $t = New-ScheduledTaskTrigger -AtLogOn
-  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-  $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-  Register-ScheduledTask -TaskName $taskName -Action $a -Trigger $t -Settings $s -Principal $p | Out-Null
-  OK 'PC起動（サインイン）時に自動で立ち上がるようにしました'
+  $a = New-ScheduledTaskAction -Execute 'powershell.exe' `
+         -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watch`""
+  $t1 = New-ScheduledTaskTrigger -AtLogOn
+  $t2 = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(6) `
+          -RepetitionInterval (New-TimeSpan -Minutes 10)
+  $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+           -StartWhenAvailable -MultipleInstances IgnoreNew
+  $pr = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+          -LogonType Interactive -RunLevel Highest
+  Register-ScheduledTask -TaskName $taskName -Action $a -Trigger @($t1, $t2) `
+    -Settings $set -Principal $pr | Out-Null
+  OK 'タスク KDS-ClinicCall を登録（サインイン時＋10分おき）'
 } catch { WARN "自動起動の登録に失敗: $($_.Exception.Message)" }
 
-# 既に動いているものは残し、止まっているものだけ起こす
+# いま動かす
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $watch
+Start-Sleep -Seconds 3
 function PortUp($port) {
   try { return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) }
   catch { return $false }
-}
-if (-not (PortUp 3000)) {
-  Start-Process -FilePath $nodeExe -ArgumentList 'server.js' -WorkingDirectory $root -WindowStyle Minimized
-  Start-Sleep -Seconds 2
-}
-if (-not (PortUp 3001)) {
-  Start-Process -FilePath $nodeExe -ArgumentList 'cert-share.js' -WorkingDirectory $root -WindowStyle Minimized
-  Start-Sleep -Seconds 2
 }
 if (PortUp 3000) { OK '呼び出しサーバー（3000番）稼働中' } else { NG '呼び出しサーバー（3000番）が起動できませんでした' }
 if (PortUp 3001) { OK '証明書ページ（3001番）稼働中' } else { NG '証明書ページ（3001番）が起動できませんでした' }
@@ -349,6 +421,7 @@ Say ''
 if ($ok) {
   Say '================ 修復できました ================' 'Green'
   Say "iPadでSafariを開き、画面に出ているQRを読み取ってください。" 'White'
+  Say "受付画面（受信）は自動で開きます。毎朝の「受信開始」を押す必要はもうありません。" 'White'
   Say "（手入力なら http://${ip}:3001/ ）" 'White'
 } else {
   Say '============ まだ直っていません ============' 'Red'
