@@ -1,0 +1,360 @@
+# ==========================================================
+#  院内呼び出しシステム／受付PC 自己診断＆修復
+#  実行（管理者のターミナルで次の1行）:
+#    irm https://shin3578-oss.github.io/kds-dashboard/callfix.txt | iex
+#
+#  やること:
+#   1) clinic-call フォルダとNode.jsを見つける
+#   2) 受付PCの今のIPを実測し、証明書がそのIP向けか確認（違えば作り直し）
+#   3) 院内CA(rootCA.pem)を配信フォルダへ設置  ← 「DLできない」の直接の原因
+#   4) 警告の出ないHTTP(3001番)で「証明書の入れ方ページ」を公開
+#   5) ファイアウォール許可・PC起動時の自動起動を設定
+#   6) 実際にダウンロードできるところまで検証して結果を表示
+# ==========================================================
+$ErrorActionPreference = 'Stop'
+$log = New-Object System.Collections.Generic.List[string]
+function Say($m, $c = 'Gray') { Write-Host $m -ForegroundColor $c; $null = $log.Add($m) }
+function Step($n, $m) { Say ''; Say "■ [$n] $m" 'Cyan' }
+function OK($m)   { Say "   OK   $m" 'Green' }
+function NG($m)   { Say "   NG   $m" 'Red' }
+function WARN($m) { Say "   注意 $m" 'Yellow' }
+
+Say '=== 院内呼び出しシステム 受付PC 修復ツール ===' 'White'
+
+# --- 管理者確認 -------------------------------------------------------------
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) {
+  Write-Host ''
+  Write-Host '  管理者として実行されていません。' -ForegroundColor Yellow
+  Write-Host '  スタートボタンを右クリック →「ターミナル（管理者）」を開き、同じ1行を貼ってください。' -ForegroundColor Yellow
+  Write-Host ''
+  return
+}
+
+# --- 1. フォルダとNode.js ---------------------------------------------------
+Step 1 'clinic-call フォルダとNode.jsを探す'
+$desk = [Environment]::GetFolderPath('Desktop')
+$cands = @(
+  (Join-Path $desk 'clinic-call'),
+  (Join-Path $env:USERPROFILE 'Desktop\clinic-call'),
+  (Join-Path $env:USERPROFILE 'Desktop\AI\clinic-call'),
+  'C:\clinic-call'
+) | Select-Object -Unique
+$root = $cands | Where-Object { Test-Path (Join-Path $_ 'server.js') } | Select-Object -First 1
+if (-not $root) {
+  $hit = Get-ChildItem $desk -Recurse -Depth 3 -Filter 'server.js' -ErrorAction SilentlyContinue |
+         Where-Object { $_.DirectoryName -like '*clinic-call*' } | Select-Object -First 1
+  if ($hit) { $root = $hit.DirectoryName }
+}
+if (-not $root) {
+  NG 'clinic-call フォルダが見つかりません（server.js が無い）。'
+  Say '     デスクトップに clinic-call フォルダがあるか確認してください。' 'Yellow'
+  return
+}
+OK "フォルダ: $root"
+
+$node = (Get-Command node.exe -ErrorAction SilentlyContinue)
+if (-not $node) {
+  foreach ($p in @('C:\Program Files\nodejs\node.exe', 'C:\Program Files (x86)\nodejs\node.exe')) {
+    if (Test-Path $p) { $node = Get-Item $p; break }
+  }
+}
+if (-not $node) {
+  NG 'Node.js が見つかりません。'
+  Say "     $root の node-setup.msi をダブルクリックして入れてから、もう一度この1行を実行してください。" 'Yellow'
+  return
+}
+$nodeExe = $node.Source
+if (-not $nodeExe) { $nodeExe = $node.FullName }
+OK "Node.js: $nodeExe"
+
+# --- 2. IPアドレスの実測 ----------------------------------------------------
+Step 2 '受付PCの今のIPアドレスを調べる'
+$cfg = Get-NetIPConfiguration | Where-Object {
+         $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' -and $_.IPv4Address
+       } | Select-Object -First 1
+if (-not $cfg) { NG 'ネットワークに繋がっていません。'; return }
+$ip = ($cfg.IPv4Address | Select-Object -First 1).IPAddress
+$expected = '192.168.0.71'
+if ($ip -eq $expected) { OK "IP: $ip （記録どおり）" }
+else { WARN "IP: $ip （記録は $expected です。IPが変わっています＝既存のiPadも繋がらなくなります）" }
+
+# --- 3. 院内CA（rootCA.pem）の設置 -----------------------------------------
+Step 3 '院内CAを配信フォルダへ置く（これが「DLできない」の原因）'
+$mk = Join-Path $root 'mkcert.exe'
+if (-not (Test-Path $mk)) { NG "mkcert.exe がありません: $mk"; return }
+Push-Location $root
+try {
+  $caroot = (& $mk -CAROOT 2>&1 | Select-Object -First 1).ToString().Trim()
+  $caPem  = Join-Path $caroot 'rootCA.pem'
+  if (-not (Test-Path $caPem)) {
+    Say '     院内CAがまだ無いので作成します…'
+    & $mk -install 2>&1 | Out-Null
+  }
+  if (-not (Test-Path $caPem)) { NG "院内CAを作れませんでした: $caPem"; return }
+  $pub = Join-Path $root 'public'
+  if (-not (Test-Path $pub)) { New-Item -ItemType Directory -Path $pub | Out-Null }
+  Copy-Item $caPem (Join-Path $pub 'rootCA.pem') -Force
+  OK "配信フォルダへ設置: public\rootCA.pem （元: $caPem）"
+
+  # 秘密鍵が紛れ込んでいないか（絶対に配ってはいけないもの）
+  $leak = Join-Path $pub 'rootCA-key.pem'
+  if (Test-Path $leak) { Remove-Item $leak -Force; WARN 'public にあった rootCA-key.pem（秘密鍵）を削除しました' }
+
+  # --- 4. 証明書が今のIP向けか ---------------------------------------------
+  Step 4 'サーバー証明書が今のIP向けかを確認'
+  $certFile = Join-Path $root 'certs\cert.pem'
+  $needNew = $true
+  if (Test-Path $certFile) {
+    try {
+      $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certFile)
+      $san = ($c.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' })
+      $sanText = if ($san) { $san.Format($false) } else { '' }
+      if ($sanText -match [regex]::Escape($ip)) {
+        if ($c.NotAfter -gt (Get-Date).AddDays(14)) {
+          $needNew = $false
+          OK ("今のIPに一致・有効期限 " + $c.NotAfter.ToString('yyyy/MM/dd') + " まで")
+        } else { WARN '有効期限が近いので作り直します' }
+      } else { WARN "証明書が今のIP($ip)向けではありません。作り直します" }
+    } catch { WARN '証明書が読めませんでした。作り直します' }
+  } else { WARN '証明書がありません。作ります' }
+
+  if ($needNew) {
+    if (-not (Test-Path (Join-Path $root 'certs'))) { New-Item -ItemType Directory -Path (Join-Path $root 'certs') | Out-Null }
+    & $mk -key-file 'certs\key.pem' -cert-file 'certs\cert.pem' $ip 'localhost' '127.0.0.1' 2>&1 | Out-Null
+    if (Test-Path $certFile) { OK "証明書を $ip 向けに作り直しました（iPadは証明書を入れ直す必要があります）" }
+    else { NG '証明書の作成に失敗しました'; return }
+  }
+} finally { Pop-Location }
+
+# --- 5. 証明書の配布サーバー（HTTP・3001番）--------------------------------
+Step 5 '「証明書の入れ方ページ」をHTTPで公開する（警告が出ない入口）'
+$shareJs = Join-Path $root 'cert-share.js'
+$js = @'
+// 院内CAの配布専用サーバー（HTTPS警告の堂々巡りを避けるため、あえて平文HTTP）
+// 配るのは公開用のrootCA.pemと説明ページだけ。秘密鍵は絶対に配りません。
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const os = require('os');
+
+const PORT = Number(process.env.CERT_PORT || 3001);
+const CA = path.join(__dirname, 'public', 'rootCA.pem');
+
+function lanIp() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const n of list || []) {
+      if (n.family === 'IPv4' && !n.internal && n.address.startsWith('192.168.')) return n.address;
+    }
+  }
+  return 'この受付PCのIP';
+}
+
+const QR_IPAD = 'iVBORw0KGgoAAAANSUhEUgAAAQgAAAEIAQAAAACLjVdSAAABmklEQVR4nO1Zy3IDMQhDnv3/X1ZHCDZNLznVcUs2Ow5mOBAND0HAePGsVwbxsfi/eAQ7QKiXuvK7lqd4urZYXEYiAkHoDAKpKG3MwyOEQgSYJwxOayfi4YcGwMic5+nab0EFheLDx9v8eHd8MEUwCAoRRUprB+KBviBzJT8P7Tg8WCKfMoanebp2WSABUF9hdpYqqBki4/rtynxJLNCpI1KWdCTryEme7uKnTCnMT4ubWj+Qn7KZV3S6SOVmw5H1I+6koQoJAtlhXEQO8nSXBStAIJ6e01zeDNVRnu6xABUVVHhkm3GvMXc/y9M9/YVZNqB7fSllJEysH6wZjhQKXVkN0Lj6cT26STQStfpwOR3KP1ho8KYivTCbly/0EBf69aokAkLR4fcgTzdYoAroXUnZu7GUOXi+xT3S1uYww2YeHrBUS6GmpcYkZvaX6P06vRrrTci8+nHpKLrOYqclVCMeiEc9KEh63p8YH+snHGxMNNAoTA709Lfjgymyp35HiKY6zv7/Nny92Wkuy8bxsT/i6fpYPD178PgCxs7G6AkHGs0AAAAASUVORK5CYII=';
+
+function page() {
+  const ip = lanIp();
+  return `<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>院内呼び出し iPadの設定</title>
+<style>
+ body{font-family:-apple-system,"Hiragino Kaku Gothic ProN",sans-serif;margin:0;padding:20px 16px 60px;
+      background:#f6f7f9;color:#1c2430;line-height:1.7;-webkit-text-size-adjust:100%}
+ h1{font-size:22px;margin:0 0 4px} .sub{color:#5b6774;font-size:14px;margin:0 0 20px}
+ .card{background:#fff;border-radius:12px;padding:18px 16px;margin:0 0 14px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+ .n{display:inline-block;width:26px;height:26px;line-height:26px;text-align:center;border-radius:50%;
+    background:#1f6feb;color:#fff;font-weight:700;font-size:15px;margin-right:8px}
+ .big{display:block;text-align:center;background:#1f6feb;color:#fff;text-decoration:none;
+      font-size:19px;font-weight:700;padding:16px;border-radius:10px;margin:14px 0}
+ .warn{background:#fff6e5;border-left:4px solid #f0a500;padding:12px 14px;border-radius:6px;font-size:15px}
+ .ng{background:#ffeceb;border-left:4px solid #e5484d;padding:12px 14px;border-radius:6px;font-size:15px}
+ code{background:#eef1f5;padding:2px 6px;border-radius:4px;font-size:14px}
+ img{display:block;margin:12px auto;width:200px;height:200px;image-rendering:pixelated}
+ ol{padding-left:22px;margin:8px 0} li{margin:6px 0}
+</style></head><body>
+<h1>iPadの初期設定</h1>
+<p class="sub">この画面はiPadで開いてください。上から順に1回だけやれば終わりです。</p>
+
+<div class="card">
+  <p><span class="n">1</span><b>この画面をSafariで開いていますか？</b></p>
+  <div class="ng">Chromeなど他のブラウザだと、次の証明書が<b>入りません</b>（押しても何も起きません）。
+  かならず<b>Safari</b>で <code>http://${ip}:3001/</code> を開き直してください。</div>
+</div>
+
+<div class="card">
+  <p><span class="n">2</span><b>院内の証明書をダウンロード</b></p>
+  <a class="big" href="/rootCA.pem">証明書をダウンロード</a>
+  <div class="warn"><b>押したあと、8分以内に次の3へ進んでください。</b>
+  8分たつとダウンロードしたものが自動で消えて、やり直しになります。</div>
+</div>
+
+<div class="card">
+  <p><span class="n">3</span><b>設定アプリでインストール</b></p>
+  <ol>
+    <li>iPadの<b>設定</b>アプリを開く</li>
+    <li>いちばん上のあたりに出る<b>「プロファイルがダウンロードされました」</b>をタップ</li>
+    <li>右上の<b>インストール</b> → パスコード → <b>インストール</b> → <b>インストール</b></li>
+  </ol>
+  <div class="warn">「プロファイルがダウンロードされました」が出ていないときは、2に戻ってやり直し（8分で消えています）。</div>
+</div>
+
+<div class="card">
+  <p><span class="n">4</span><b>信頼のスイッチを入れる（ここを飛ばすと動きません）</b></p>
+  <ol>
+    <li><b>設定 → 一般 → 情報 →</b> いちばん下の<b>証明書信頼設定</b></li>
+    <li><b>mkcert</b> で始まる項目の<b>スイッチをオン</b>（緑にする）</li>
+  </ol>
+</div>
+
+<div class="card">
+  <p><span class="n">5</span><b>呼び出し画面を開く</b></p>
+  <a class="big" href="https://${ip}:3000/ipad.html">呼び出し画面をひらく</a>
+  ${ip === '192.168.0.71' ? `<img src="data:image/png;base64,${QR_IPAD}" alt="呼び出し画面のQR">` : ''}
+  <ol>
+    <li>マイクの許可を聞かれたら<b>許可</b></li>
+    <li>画面の<b>共有ボタン → ホーム画面に追加</b>で、アプリのように使えます</li>
+  </ol>
+  <div class="warn">マイクが「許可されていません」と出るとき →
+  <b>設定 → Safari → マイク</b> と <b>設定 → プライバシーとセキュリティ → マイク → Safari</b> の
+  <b>両方</b>を確認してください。ここは2か所あります。</div>
+</div>
+
+<p class="sub">うまくいかないときは、この画面をスクリーンショットして事務スタッフへ渡してください。</p>
+</body></html>`;
+}
+
+http.createServer((req, res) => {
+  const p = (req.url || '/').split('?')[0];
+  if (p === '/' || p === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(page());
+    return;
+  }
+  if (p === '/rootCA.pem') {
+    fs.readFile(CA, (err, data) => {
+      if (err) { res.writeHead(404); res.end('rootCA.pem がありません'); return; }
+      // この種別で返さないとiOSが「プロファイル」として取り込まない
+      res.writeHead(200, {
+        'Content-Type': 'application/x-x509-ca-cert',
+        'Content-Disposition': 'attachment; filename="kds-rootCA.pem"',
+        'Cache-Control': 'no-store',
+      });
+      res.end(data);
+    });
+    return;
+  }
+  res.writeHead(404); res.end('Not Found');
+}).listen(PORT, () => {
+  console.log(`[cert-share] http://${lanIp()}:${PORT}/ で証明書の入れ方ページを公開中`);
+});
+'@
+Set-Content -Path $shareJs -Value $js -Encoding UTF8
+OK "作成: cert-share.js"
+
+# --- 6. ファイアウォール ----------------------------------------------------
+Step 6 '院内から繋がるようにファイアウォールを開ける'
+foreach ($p in 3000, 3001) {
+  $name = "KDS院内呼び出し TCP$p"
+  if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow `
+      -Protocol TCP -LocalPort $p -Profile Any | Out-Null
+    OK "$p 番を許可しました"
+  } else { OK "$p 番はすでに許可済み" }
+}
+
+# --- 7. 起動 & 自動起動 -----------------------------------------------------
+Step 7 'サーバーを起動し、PC起動時に自動で立ち上がるようにする'
+$cmd = Join-Path $root 'start_call.cmd'
+$cmdBody = @"
+@echo off
+cd /d "$root"
+start "" /min "$nodeExe" server.js
+start "" /min "$nodeExe" cert-share.js
+"@
+Set-Content -Path $cmd -Value $cmdBody -Encoding Default
+OK "起動用: start_call.cmd"
+
+$taskName = 'KDS-ClinicCall'
+try {
+  if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+  }
+  $a = New-ScheduledTaskAction -Execute $cmd
+  $t = New-ScheduledTaskTrigger -AtLogOn
+  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+  $p = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+  Register-ScheduledTask -TaskName $taskName -Action $a -Trigger $t -Settings $s -Principal $p | Out-Null
+  OK 'PC起動（サインイン）時に自動で立ち上がるようにしました'
+} catch { WARN "自動起動の登録に失敗: $($_.Exception.Message)" }
+
+# 既に動いているものは残し、止まっているものだけ起こす
+function PortUp($port) {
+  try { return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) }
+  catch { return $false }
+}
+if (-not (PortUp 3000)) {
+  Start-Process -FilePath $nodeExe -ArgumentList 'server.js' -WorkingDirectory $root -WindowStyle Minimized
+  Start-Sleep -Seconds 2
+}
+if (-not (PortUp 3001)) {
+  Start-Process -FilePath $nodeExe -ArgumentList 'cert-share.js' -WorkingDirectory $root -WindowStyle Minimized
+  Start-Sleep -Seconds 2
+}
+if (PortUp 3000) { OK '呼び出しサーバー（3000番）稼働中' } else { NG '呼び出しサーバー（3000番）が起動できませんでした' }
+if (PortUp 3001) { OK '証明書ページ（3001番）稼働中' } else { NG '証明書ページ（3001番）が起動できませんでした' }
+
+# --- 8. 実際にダウンロードできるか検証 --------------------------------------
+Step 8 'iPadと同じやり方で、本当にダウンロードできるか試す'
+$ok = $true
+try {
+  $r = Invoke-WebRequest "http://${ip}:3001/rootCA.pem" -UseBasicParsing -TimeoutSec 8
+  $body = if ($r.Content -is [byte[]]) { [Text.Encoding]::ASCII.GetString($r.Content) } else { [string]$r.Content }
+  if ($r.StatusCode -eq 200 -and $body -like '*BEGIN CERTIFICATE*') {
+    OK ("証明書のダウンロード成功（" + $body.Length + " バイト・種別 " + $r.Headers['Content-Type'] + "）")
+  } else { NG "ダウンロードの中身が証明書ではありません"; $ok = $false }
+} catch { NG "証明書のダウンロードに失敗: $($_.Exception.Message)"; $ok = $false }
+
+try {
+  $r2 = Invoke-WebRequest "http://${ip}:3001/" -UseBasicParsing -TimeoutSec 8
+  if ($r2.StatusCode -eq 200) { OK '説明ページの表示OK' } else { NG '説明ページが出ません'; $ok = $false }
+} catch { NG "説明ページに繋がりません: $($_.Exception.Message)"; $ok = $false }
+
+if (Test-Path (Join-Path $root 'public\rootCA-key.pem')) { NG '秘密鍵が配信フォルダに残っています'; $ok = $false }
+else { OK '秘密鍵は配信されていません（安全）' }
+
+# --- 9. 受付PCの画面にQRを出す ---------------------------------------------
+Step 9 'iPadで読み取るQRコードを表示する'
+$qrCert = 'iVBORw0KGgoAAAANSUhEUgAAAOgAAADoAQAAAADN0pXVAAABQUlEQVR4nO1ZQQ7DIAyzUf//ZU+Jge60w6JKERvVuoKlyakxIYzChzY+gfij/d8GtARWXjGwR9ST8yigV0YKgBBFAfGZI005jypKMjuc1x5pzLmO0pNavVg9iSqEfeSXW/kXS1Jq3fQr67PmKm3oSH21O6J76s151FB6ZeY0MMRoB+cjRmiCImbKHfu4L+dvUXqHkTHS+ubGwzH35DyKqGL2KtanUNra5itozLmgL1NiTvemi52Eda5/xSgTUlxHq0xLfTlX/Iu5p1J2bj935TyqqHbOZSakPbUbcy74F067sI3DyUvrQ+ezG8O6b0VwW86jgF63e7EK4C06zj7fgKfx/XRofaRZHWGuVDl8aH007kd5Dx1HHLHTOnc+r6atsJeuc/Ov9gkHokbqweox/7ppuTe/TvUv//+nvLWeGlXQF/K3kp6L7+0cAAAAAElFTkSuQmCC'
+$qrHtml = Join-Path $root 'iPad用QR.html'
+if ($ip -eq $expected) {
+  $img = "<img src='data:image/png;base64,$qrCert' style='width:320px;height:320px;image-rendering:pixelated'>"
+} else {
+  $img = "<p style='color:#e5484d;font-weight:700'>IPが変わったためQRは使えません。iPadのSafariに下のURLを手で入力してください。</p>"
+}
+$h = "<!doctype html><html lang='ja'><head><meta charset='utf-8'><title>iPad用QR</title></head>" +
+     "<body style='font-family:sans-serif;text-align:center;padding:40px'>" +
+     "<h1>iPadでこのQRを読み取ってください</h1>" +
+     "<p style='font-size:22px'>Safariのカメラ／カメラアプリでQRを読むと設定ページが開きます</p>" +
+     $img +
+     "<p style='font-size:26px;font-weight:700'>http://${ip}:3001/</p>" +
+     "<p style='color:#5b6774'>この画面は受付PC用です。iPadの設定が全部終わったら閉じて構いません。</p>" +
+     "</body></html>"
+Set-Content -Path $qrHtml -Value $h -Encoding UTF8
+Start-Process $qrHtml
+OK "受付PCの画面にQRを表示しました（$qrHtml）"
+
+# --- 結果 -------------------------------------------------------------------
+Say ''
+if ($ok) {
+  Say '================ 修復できました ================' 'Green'
+  Say "iPadでSafariを開き、画面に出ているQRを読み取ってください。" 'White'
+  Say "（手入力なら http://${ip}:3001/ ）" 'White'
+} else {
+  Say '============ まだ直っていません ============' 'Red'
+  Say 'この画面をそのまま院長へ送ってください。' 'White'
+}
+$out = Join-Path ([Environment]::GetFolderPath('Desktop')) '院内呼び出し_診断結果.txt'
+Set-Content -Path $out -Value ($log -join "`r`n") -Encoding UTF8
+Say ''
+Say "結果をデスクトップに保存しました: $out" 'Gray'
