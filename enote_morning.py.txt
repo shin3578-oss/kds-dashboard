@@ -24,6 +24,7 @@
 """
 
 import asyncio
+import ctypes
 import glob
 import json
 import os
@@ -36,7 +37,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -473,6 +474,35 @@ def open_notes(targets: list[dict]) -> tuple[int, str]:
     return len(linked), "mixed" if linked else "launcher"
 
 
+def boot_time() -> datetime:
+    """PCが起動した時刻（GetTickCount64=起動からの経過ミリ秒を今から引く）。"""
+    return datetime.now() - timedelta(milliseconds=ctypes.windll.kernel32.GetTickCount64())
+
+
+def reopen_if_rebooted() -> bool:
+    """再起動で患者一覧のウィンドウが消えていたら today.html だけ開き直す。
+
+    朝の実行後に院長がPCを再起動すると、開いていた一覧が閉じてしまう。1日1回マーカーが
+    あるので通常の再実行では開き直されず、一覧が無いまま診療が始まる
+    （2026-08-29に実際に発生: 08:24実行 → 08:57再起動 → 一覧消失）。
+    「PCの起動時刻 > today.html の更新時刻」なら、あの一覧はもう画面に無いと判断できる。
+    アポツールへの再取得も通知もせず、既にできている一覧をそのまま出すだけ。
+    開き直したら today.html に触れて時刻を更新し、同じ起動で何度も開かないようにする。
+    """
+    out = BASE_DIR / "today.html"
+    if not out.exists():
+        return False
+    written = datetime.fromtimestamp(out.stat().st_mtime)
+    if written.date() != date.today():
+        return False
+    if boot_time() <= written:
+        return False
+    log("再起動を検知（一覧ウィンドウが閉じている）→ today.html を開き直します")
+    open_url(str(out))
+    out.touch()
+    return True
+
+
 def build_launcher_html(targets: list[dict], links: dict) -> str:
     today = date.today()
     wd = "月火水木金土日"[today.weekday()]
@@ -552,7 +582,10 @@ def main():
                 "この後の毎日トリガーで実行されます")
             return
         if ran_today():
-            log("本日は既に実行済みのためスキップ")
+            if reopen_if_rebooted():
+                log("=== 開き直し完了 ===")
+            else:
+                log("本日は既に実行済みのためスキップ")
             return
 
     try:
